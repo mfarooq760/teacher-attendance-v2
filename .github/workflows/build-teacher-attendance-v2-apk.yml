@@ -23,15 +23,29 @@ jobs:
         with:
           gradle-version: '8.6'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android API 34 and accept licenses
+      - name: Use runner Android SDK (no extra installer)
         run: |
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
-          yes | sdkmanager --licenses || true
-          test -n "$ANDROID_HOME"
-          test -d "$ANDROID_HOME/platforms/android-34"
+          set -euo pipefail
+          ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          if [ ! -d "$ANDROID_HOME/platforms" ]; then
+            echo "Runner has no Android platforms; downloading command-line tools to \$HOME/android-sdk"
+            ANDROID_HOME="$HOME/android-sdk"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            rm -rf /tmp/cmdline-tools-zip
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdline-tools-zip
+            mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+            mv /tmp/cmdline-tools-zip/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+            yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+            "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          fi
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "Using Android SDK at $ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms"
 
       - name: Clean and Generate Pristine Android Project
         run: |
@@ -1793,7 +1807,12 @@ jobs:
 
       - name: Generate Wrapper 8.6
         run: |
+          set -euo pipefail
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          SDK_VER=$(ls "$ANDROID_HOME/platforms" | sed 's/android-//' | sort -n | tail -n1)
+          echo "Matching compileSdk/targetSdk to installed platform android-$SDK_VER"
+          sed -i "s/compileSdk 34/compileSdk $SDK_VER/" app/build.gradle
+          sed -i "s/targetSdk 34/targetSdk $SDK_VER/" app/build.gradle
           gradle wrapper --gradle-version 8.6 --distribution-type bin
           chmod +x gradlew
 
