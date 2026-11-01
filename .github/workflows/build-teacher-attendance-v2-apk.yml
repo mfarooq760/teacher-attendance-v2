@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -23,34 +23,9 @@ jobs:
         with:
           gradle-version: '8.6'
 
-      - name: Use runner Android SDK (no extra installer)
-        run: |
-          set -euo pipefail
-          ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-
-          if [ ! -d "$ANDROID_HOME/platforms" ]; then
-            echo "Runner has no Android platforms; downloading command-line tools to \$HOME/android-sdk"
-            ANDROID_HOME="$HOME/android-sdk"
-            mkdir -p "$ANDROID_HOME/cmdline-tools"
-            curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-            rm -rf /tmp/cmdline-tools-zip
-            unzip -q /tmp/cmdtools.zip -d /tmp/cmdline-tools-zip
-            mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
-            mv /tmp/cmdline-tools-zip/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
-            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-            yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
-            "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "platforms;android-34" "build-tools;34.0.0" "platform-tools"
-          fi
-
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "Using Android SDK at $ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms"
-
       - name: Clean and Generate Pristine Android Project
         run: |
-          # 0. Clean any conflicting files from previous runs
-          rm -rf app build.gradle* settings.gradle*
+          rm -rf app build.gradle* settings.gradle* local.properties
 
           mkdir -p app/src/main/java/com/school/teacherrecords
           mkdir -p app/src/main/res/xml
@@ -83,7 +58,7 @@ jobs:
           }
           EOF
 
-          # 2b. gradle.properties
+          # 3. gradle.properties
           cat << 'EOF' > gradle.properties
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           android.useAndroidX=true
@@ -91,7 +66,7 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-          # 3. app/build.gradle
+          # 4. app/build.gradle
           cat << 'EOF' > app/build.gradle
           plugins {
               id 'com.android.application'
@@ -136,11 +111,12 @@ jobs:
               implementation 'androidx.compose.ui:ui'
               implementation 'androidx.compose.foundation:foundation'
               implementation 'androidx.compose.material3:material3'
+              implementation 'androidx.compose.material:material-icons-core'
               implementation 'com.google.code.gson:gson:2.10.1'
           }
           EOF
 
-          # 4. AndroidManifest.xml
+          # 5. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -173,7 +149,7 @@ jobs:
           </manifest>
           EOF
 
-          # 5. file_paths.xml
+          # 6. file_paths.xml
           cat << 'EOF' > app/src/main/res/xml/file_paths.xml
           <?xml version="1.0" encoding="utf-8"?>
           <paths xmlns:android="http://schemas.android.com/apk/res/android">
@@ -181,7 +157,7 @@ jobs:
           </paths>
           EOF
 
-          # 6. DatabaseHelper.kt (three related tables)
+          # 7. DatabaseHelper.kt
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/DatabaseHelper.kt
           package com.school.teacherrecords
 
@@ -191,7 +167,6 @@ jobs:
           import android.database.sqlite.SQLiteDatabase
           import android.database.sqlite.SQLiteOpenHelper
 
-          // ---------- Row models ----------
           data class Teacher(
               val recordId: Long,
               val name: String,
@@ -215,15 +190,13 @@ jobs:
               val leave: Int
           )
 
-          // One attendance record joined with teacher info (used for printing)
           data class PrintRow(
-              val date: String,       // yyyy-MM-dd
+              val date: String,
               val name: String,
               val fatherName: String,
               val status: String
           )
 
-          // ---------- Backup models ----------
           data class TeacherRow(val recordId: Long, val name: String, val fatherName: String, val appointmentSession: String)
           data class EnrollmentRow(val enrollmentId: Long, val teacherId: Long, val session: String, val month: Int)
           data class AttendanceRow(val attendanceId: Long, val teacherId: Long, val enrollmentId: Long, val date: String, val status: String)
@@ -242,7 +215,6 @@ jobs:
               }
 
               override fun onCreate(db: SQLiteDatabase) {
-                  // Table 1: basic information
                   db.execSQL("""
                       CREATE TABLE tblTeachers (
                           RecordID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -252,7 +224,6 @@ jobs:
                       )
                   """.trimIndent())
 
-                  // Table 2: attendance enrolment. One row per teacher + session + month (composite unique)
                   db.execSQL("""
                       CREATE TABLE tblAttendanceEnrollment (
                           EnrollmentID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,7 +237,6 @@ jobs:
                   createRecordsTable(db)
               }
 
-              // Table 3: only absent / late / half day / leave, with the full date
               private fun createRecordsTable(db: SQLiteDatabase) {
                   db.execSQL("""
                       CREATE TABLE tblAttendanceRecords (
@@ -282,13 +252,11 @@ jobs:
 
               override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
                   if (oldVersion < 2) {
-                      // Version 1 stored only a day number; it cannot be converted to a full date.
                       db.execSQL("DROP TABLE IF EXISTS tblAttendanceRecords")
                       createRecordsTable(db)
                   }
               }
 
-              // ---------- Counts ----------
               fun getCounts(): Triple<Int, Int, Int> {
                   val db = readableDatabase
                   return Triple(
@@ -298,7 +266,6 @@ jobs:
                   )
               }
 
-              // ---------- Table 1: teachers ----------
               fun getTeachers(sessionPrefix: String): List<Teacher> {
                   val list = mutableListOf<Teacher>()
                   val sql = "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers" +
@@ -313,7 +280,6 @@ jobs:
                   return list
               }
 
-              // Teachers appointed in or before the given session
               fun getEligibleTeachers(session: String): List<Teacher> {
                   val list = mutableListOf<Teacher>()
                   val sql = "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers " +
@@ -344,7 +310,6 @@ jobs:
                   writableDatabase.update("tblTeachers", v, "RecordID = ?", arrayOf(recordId.toString()))
               }
 
-              // Deletes the teacher AND all dependent rows in table 2 and table 3
               fun deleteTeacher(recordId: Long) {
                   val db = writableDatabase
                   val id = arrayOf(recordId.toString())
@@ -359,7 +324,6 @@ jobs:
                   }
               }
 
-              // ---------- Table 2: enrolment ----------
               fun enrol(recordIds: List<Long>, session: String, months: List<Int>): Int {
                   var added = 0
                   val db = writableDatabase
@@ -409,7 +373,6 @@ jobs:
                   return list
               }
 
-              // Teachers enrolled in at least one month of the session
               fun getTeachersEnrolledInSession(session: String): List<Teacher> {
                   val list = mutableListOf<Teacher>()
                   val sql = "SELECT DISTINCT t.RecordID, t.TeacherName, t.FatherHusbandName, t.AppointmentSession " +
@@ -423,8 +386,6 @@ jobs:
                   return list
               }
 
-              // ---------- Table 3: attendance records ----------
-              // Returns enrollmentId -> status for the given full date (yyyy-MM-dd)
               fun getAttendanceForDate(session: String, month: Int, date: String): Map<Long, String> {
                   val map = mutableMapOf<Long, String>()
                   val sql = "SELECT r.AttendanceEnrollmentIDFK, r.AttendanceStatus " +
@@ -436,8 +397,6 @@ jobs:
                   return map
               }
 
-              // "P" (present) removes any record for that date; other statuses are stored.
-              // Only one status per teacher per date is kept.
               fun saveAttendanceDay(date: String, enrolled: List<EnrolledTeacher>, statuses: Map<Long, String>) {
                   val db = writableDatabase
                   db.beginTransaction()
@@ -465,7 +424,6 @@ jobs:
                   }
               }
 
-              // Deletes ONLY attendance records of one teacher (basic info and enrolments stay)
               fun deleteAttendanceRecords(recordId: Long, session: String, month: Int?): Int {
                   val sub = "SELECT EnrollmentID FROM tblAttendanceEnrollment WHERE AttendanceEnrollmentSession = ?" +
                       (if (month != null) " AND AttendanceEnrollmentMonth = ?" else "")
@@ -478,7 +436,6 @@ jobs:
                   )
               }
 
-              // ---------- Print: session + date range (dates are yyyy-MM-dd) ----------
               fun getAttendanceBetween(session: String, fromDate: String, toDate: String): List<PrintRow> {
                   val list = mutableListOf<PrintRow>()
                   val sql = "SELECT r.AttendanceDate, t.TeacherName, t.FatherHusbandName, r.AttendanceStatus " +
@@ -495,7 +452,6 @@ jobs:
                   return list
               }
 
-              // ---------- Monthly report ----------
               fun getMonthlyReport(session: String, month: Int): List<ReportRow> {
                   val list = mutableListOf<ReportRow>()
                   val sql = "SELECT t.TeacherName, t.FatherHusbandName, " +
@@ -516,7 +472,6 @@ jobs:
                   return list
               }
 
-              // ---------- Backup / restore (all three tables) ----------
               fun getBackup(): BackupData {
                   val db = readableDatabase
                   val teachers = mutableListOf<TeacherRow>()
@@ -540,7 +495,6 @@ jobs:
                   return BackupData(3, teachers, enrollments, attendance)
               }
 
-              // Replaces ALL current data with the backup
               fun restoreBackup(data: BackupData) {
                   val db = writableDatabase
                   db.beginTransaction()
@@ -584,7 +538,7 @@ jobs:
           }
           EOF
 
-          # 7. Common.kt (constants, session mask, dates, shared controls)
+          # 8. Common.kt
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/Common.kt
           @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 
@@ -624,7 +578,6 @@ jobs:
               else -> code
           }
 
-          // ---------- Dates (stored as yyyy-MM-dd) ----------
           fun isLeapYear(y: Int): Boolean = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 
           fun daysInMonth(year: Int, month: Int): Int = when (month) {
@@ -659,7 +612,6 @@ jobs:
               ).show()
           }
 
-          // ---------- Session mask 0000/00 ----------
           fun formatSessionInput(raw: String): String {
               val d = raw.filter { it.isDigit() }.take(6)
               return if (d.length > 4) d.substring(0, 4) + "/" + d.substring(4) else d
@@ -754,7 +706,7 @@ jobs:
           }
           EOF
 
-          # 8. PrintReport.kt (A4 print of attendance records between two dates)
+          # 9. PrintReport.kt
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/PrintReport.kt
           package com.school.teacherrecords
 
@@ -782,7 +734,7 @@ jobs:
           const val SCHOOL_NAME = "Islamic International Model School"
 
           class AttendancePrintReport {
-              private val pageW = 595   // A4 portrait @72dpi
+              private val pageW = 595
               private val pageH = 842
               private val margin = 36f
               private val doc = PdfDocument()
@@ -817,14 +769,12 @@ jobs:
               private val linePaint = Paint().apply { color = Color.BLACK; strokeWidth = 1f }
               private val bgPaint = Paint().apply { color = Color.rgb(224, 224, 224) }
 
-              // Detail table columns
               private val colNo = margin
               private val colDate = margin + 28f
               private val colName = margin + 100f
               private val colFather = margin + 265f
               private val colStatus = margin + 420f
 
-              // Summary table columns
               private val sumName = margin
               private val sumFather = margin + 170f
               private val sumA = margin + 340f
@@ -854,7 +804,6 @@ jobs:
                   page = p
                   val c = p.canvas
                   canvas = c
-                  // Header on EVERY page
                   c.drawText(SCHOOL_NAME, pageW / 2f, 46f, schoolPaint)
                   c.drawText("Teacher Attendance Report", pageW / 2f, 64f, titlePaint)
                   c.drawText(
@@ -883,7 +832,6 @@ jobs:
                   }
               }
 
-              // Returns the number of pages written to [file]
               fun build(file: File, session: String, fromIso: String, toIso: String, rows: List<PrintRow>): Int {
                   this.session = session
                   this.fromIso = fromIso
@@ -911,7 +859,6 @@ jobs:
                       }
                       detailHeader = false
 
-                      // Summary per teacher
                       ensure(60f)
                       y += 14f
                       canvas!!.drawText("Summary", margin, y, boldPaint)
@@ -941,7 +888,6 @@ jobs:
                       }
                   }
 
-                  // End of report
                   ensure(46f)
                   y += 12f
                   canvas!!.drawLine(margin, y, pageW - margin, y, linePaint)
@@ -957,7 +903,6 @@ jobs:
               }
           }
 
-          // Hands the generated PDF to Android's print system (print or "Save as PDF")
           class AttendancePrintAdapter(
               private val context: Context,
               private val jobTitle: String,
@@ -1022,7 +967,7 @@ jobs:
           }
           EOF
 
-          # 9. Screens.kt (all forms)
+          # 10. Screens.kt
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/Screens.kt
           @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 
@@ -1063,9 +1008,6 @@ jobs:
               ) { Text(text) }
           }
 
-          // =====================================================================
-          // DASHBOARD
-          // =====================================================================
           @Composable
           fun DashboardScreen(db: DatabaseHelper, onNavigate: (Screen) -> Unit) {
               val counts = remember { db.getCounts() }
@@ -1110,9 +1052,6 @@ jobs:
               }
           }
 
-          // =====================================================================
-          // ADD / EDIT TEACHER  (table 1)
-          // =====================================================================
           @Composable
           fun AddTeacherScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1203,9 +1142,6 @@ jobs:
               }
           }
 
-          // =====================================================================
-          // ENROL TEACHERS  (table 2)
-          // =====================================================================
           @Composable
           fun EnrolScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1288,9 +1224,6 @@ jobs:
               }
           }
 
-          // =====================================================================
-          // TAKE ATTENDANCE  (table 3, full date)
-          // =====================================================================
           @Composable
           fun TakeAttendanceScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1302,8 +1235,6 @@ jobs:
               val statuses = remember { mutableStateMapOf<Long, String>() }
               val valid = isValidSession(session)
 
-              // A session covers two calendar years, e.g. 2026/27 -> 2026 and 2027.
-              // Default: April-December = first year, January-March = second year (changeable).
               val startYear = if (valid) session.substring(0, 4).toInt() else 0
               val yearOptions = remember(session) {
                   if (valid) listOf(startYear.toString(), (startYear + 1).toString()) else listOf("")
@@ -1403,9 +1334,6 @@ jobs:
               }
           }
 
-          // =====================================================================
-          // PRINT ATTENDANCE  (session + two dates)
-          // =====================================================================
           @Composable
           fun PrintAttendanceScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1470,9 +1398,6 @@ jobs:
               }
           }
 
-          // =====================================================================
-          // DELETE TEACHER  (cascades to tables 2 and 3)
-          // =====================================================================
           @Composable
           fun DeleteTeacherScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1527,14 +1452,11 @@ jobs:
               }
           }
 
-          // =====================================================================
-          // DELETE ATTENDANCE RECORDS OF ONE TEACHER  (table 3 only)
-          // =====================================================================
           @Composable
           fun DeleteAttendanceScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
               var session by remember { mutableStateOf("") }
-              var monthIdx by remember { mutableIntStateOf(0) }   // 0 = all months
+              var monthIdx by remember { mutableIntStateOf(0) }
               var selected by remember { mutableStateOf<Teacher?>(null) }
               var confirm by remember { mutableStateOf(false) }
               var tick by remember { mutableIntStateOf(0) }
@@ -1610,9 +1532,6 @@ jobs:
               }
           }
 
-          // =====================================================================
-          // MONTHLY REPORT + EXPORT + BACKUP / RESTORE
-          // =====================================================================
           @Composable
           fun ReportScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1723,7 +1642,6 @@ jobs:
               }
           }
 
-          // ---------- File helpers ----------
           private fun csvCell(s: String): String = "\"" + s.replace("\"", "\"\"") + "\""
 
           fun exportReportCsv(context: Context, session: String, month: Int, rows: List<ReportRow>) {
@@ -1762,7 +1680,7 @@ jobs:
           }
           EOF
 
-          # 10. MainActivity.kt (navigation)
+          # 11. MainActivity.kt
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/MainActivity.kt
           package com.school.teacherrecords
 
@@ -1807,22 +1725,11 @@ jobs:
 
       - name: Generate Wrapper 8.6
         run: |
-          set -euo pipefail
-          echo "sdk.dir=${ANDROID_HOME}" > local.properties
-          SDK_VER=$(ls "$ANDROID_HOME/platforms" | sed 's/android-//' | sort -n | tail -n1)
-          echo "Matching compileSdk/targetSdk to installed platform android-$SDK_VER"
-          sed -i "s/compileSdk 34/compileSdk $SDK_VER/" app/build.gradle
-          sed -i "s/targetSdk 34/targetSdk $SDK_VER/" app/build.gradle
           gradle wrapper --gradle-version 8.6 --distribution-type bin
           chmod +x gradlew
 
       - name: Build Debug APK
-        run: |
-          echo "JAVA_HOME=${JAVA_HOME}"
-          java -version
-          echo "ANDROID_HOME=${ANDROID_HOME}"
-          ls "${ANDROID_HOME}/platforms"
-          ./gradlew assembleDebug --stacktrace --no-daemon
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
