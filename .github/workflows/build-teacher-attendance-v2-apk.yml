@@ -571,6 +571,14 @@ jobs:
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.buildAnnotatedString
+          import androidx.compose.ui.text.input.OffsetMapping
+          import androidx.compose.ui.text.input.TransformedText
+          import androidx.compose.ui.text.input.VisualTransformation
+          import androidx.compose.ui.text.withStyle
           import androidx.compose.ui.unit.dp
           import java.text.SimpleDateFormat
           import java.util.Calendar
@@ -640,6 +648,34 @@ jobs:
               return b.toInt() == (a.toInt() + 1) % 100
           }
 
+          // Shows the mask 0000/00 permanently: typed digits are black, the rest stay grey.
+          // The cursor always sits right after the last typed digit.
+          private class SessionMaskTransformation : VisualTransformation {
+              override fun filter(text: AnnotatedString): TransformedText {
+                  val d = text.text.take(6)
+                  val shown = buildAnnotatedString {
+                      for (i in 0 until 6) {
+                          if (i == 4) append("/")
+                          if (i < d.length) {
+                              append(d[i])
+                          } else {
+                              withStyle(SpanStyle(color = Color.Gray)) { append('0') }
+                          }
+                      }
+                  }
+                  val mapping = object : OffsetMapping {
+                      override fun originalToTransformed(offset: Int): Int =
+                          if (offset < 4) offset else offset + 1
+
+                      override fun transformedToOriginal(offset: Int): Int {
+                          val o = if (offset <= 4) offset else offset - 1
+                          return o.coerceAtMost(d.length)
+                      }
+                  }
+                  return TransformedText(shown, mapping)
+              }
+          }
+
           @Composable
           fun SessionField(
               value: String,
@@ -649,11 +685,11 @@ jobs:
           ) {
               val bad = value.length == 7 && !isValidSession(value)
               OutlinedTextField(
-                  value = value,
+                  value = value.filter { it.isDigit() },
                   onValueChange = { onValueChange(formatSessionInput(it)) },
                   label = { Text(label) },
-                  placeholder = { Text("0000/00") },
                   singleLine = true,
+                  visualTransformation = remember { SessionMaskTransformation() },
                   keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                   isError = bad,
                   supportingText = { if (bad) Text("Second part must be the next year, e.g. 2026/27") },
@@ -1033,6 +1069,7 @@ jobs:
                       }
                       MenuButton("Add New Teachers", "btnAddNewTeachers") { onNavigate(Screen.ADD_TEACHER) }
                       MenuButton("Enrol Teacher (for attendance)", "btnEnrolTeacher") { onNavigate(Screen.ENROL) }
+                      MenuButton("Promote Teacher Attendance Session", "btnPromoteTeacherAttendanceSession") { onNavigate(Screen.PROMOTE) }
                       MenuButton("Take Attendance", "btnTakeAttendance") { onNavigate(Screen.ATTENDANCE) }
                       MenuButton("Print Attendance", "btnPrintAttendance") { onNavigate(Screen.PRINT) }
                       MenuButton("Monthly Report / Backup / Restore", "btnReportsBackup") { onNavigate(Screen.REPORT) }
@@ -1139,67 +1176,78 @@ jobs:
           }
 
           // =====================================================================
-          // ENROL TEACHERS  (table 2)
+          // ENROL TEACHERS  (table 2)  - first-time enrolment
           // =====================================================================
           @Composable
           fun EnrolScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
-              var session by remember { mutableStateOf("") }
+              var appointFilter by remember { mutableStateOf("") }
+              var enrolSession by remember { mutableStateOf("") }
               var monthIdx by remember { mutableIntStateOf(0) }
               var tick by remember { mutableIntStateOf(0) }
               val selected = remember { mutableStateListOf<Long>() }
-              val valid = isValidSession(session)
+              val validEnrol = isValidSession(enrolSession)
 
-              val eligible = remember(session, tick) { if (valid) db.getEligibleTeachers(session) else emptyList() }
-              val enrolled = remember(session, monthIdx, tick) {
-                  if (valid) db.getEnrolledIds(session, monthIdx + 1) else emptySet()
+              // teachers come from the basic table, filtered by APPOINTMENT session
+              val teachers = remember(appointFilter, tick) { db.getTeachers(appointFilter) }
+              // who is already enrolled in the chosen ENROLLMENT session + month
+              val enrolled = remember(enrolSession, monthIdx, tick) {
+                  if (validEnrol) db.getEnrolledIds(enrolSession, monthIdx + 1) else emptySet()
               }
 
-              LaunchedEffect(session, monthIdx) { selected.clear() }
+              LaunchedEffect(appointFilter, enrolSession, monthIdx) { selected.clear() }
 
               ScreenFrame("Enrol Teacher", onBack) {
-                  SessionField(session, { session = it }, "Attendance Session (0000/00)")
+                  Text("1. Find teachers by Appointment Session", fontWeight = FontWeight.Bold)
+                  SessionField(appointFilter, { appointFilter = it }, "Appointment Session (0000/00)")
+
+                  Text("2. Choose the Enrollment Session and month", fontWeight = FontWeight.Bold)
+                  SessionField(enrolSession, { enrolSession = it }, "Enrollment Session (0000/00)")
                   DropdownField("Attendance Month", MONTHS, monthIdx) { monthIdx = it }
 
-                  if (!valid) {
-                      Text("Type a complete session (for example 2026/27) to list teachers.", color = Color.Gray)
-                  } else if (eligible.isEmpty()) {
-                      Text("No teachers appointed in or before session $session.", color = Color.Gray)
-                  } else {
-                      Text("Tick teachers to enrol for ${MONTHS[monthIdx]} $session", fontWeight = FontWeight.Bold)
-                      eligible.forEach { t ->
-                          val already = t.recordId in enrolled
-                          Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                              Checkbox(
-                                  checked = already || t.recordId in selected,
-                                  enabled = !already,
-                                  onCheckedChange = { c ->
-                                      if (c) selected.add(t.recordId) else selected.remove(t.recordId)
-                                  }
-                              )
-                              Column {
-                                  Text(t.name, fontWeight = FontWeight.SemiBold)
-                                  Text(
-                                      t.fatherName + if (already) "   \u2714 enrolled" else "",
-                                      color = if (already) Color(0xFF2E7D32) else Color.Gray
-                                  )
+                  if (!validEnrol) {
+                      Text("Type a complete Enrollment Session (for example 2026/27) to enable enrolment.", color = Color.Gray)
+                  }
+
+                  Text("3. Tick teachers (${teachers.size} found)", fontWeight = FontWeight.Bold)
+                  if (teachers.isEmpty()) {
+                      Text("No teachers found for this appointment session.", color = Color.Gray)
+                  }
+                  teachers.forEach { t ->
+                      val already = validEnrol && t.recordId in enrolled
+                      Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                          Checkbox(
+                              checked = already || t.recordId in selected,
+                              enabled = validEnrol && !already,
+                              onCheckedChange = { c ->
+                                  if (c) selected.add(t.recordId) else selected.remove(t.recordId)
                               }
+                          )
+                          Column {
+                              Text(t.name, fontWeight = FontWeight.SemiBold)
+                              Text(
+                                  t.fatherName + "   |   appointed " + t.appointmentSession +
+                                      if (already) "   ✔ enrolled" else "",
+                                  color = if (already) Color(0xFF2E7D32) else Color.Gray
+                              )
                           }
                       }
+                  }
 
+                  if (validEnrol && teachers.isNotEmpty()) {
                       OutlinedButton(
                           onClick = {
                               selected.clear()
-                              selected.addAll(eligible.filter { it.recordId !in enrolled }.map { it.recordId })
+                              selected.addAll(teachers.filter { it.recordId !in enrolled }.map { it.recordId })
                           },
                           modifier = Modifier.fillMaxWidth()
                       ) { Text("Select All Not Yet Enrolled") }
 
-                      MenuButton("Enrol Selected for ${MONTHS[monthIdx]} (${selected.size})", "btnEnrolSelected") {
+                      MenuButton("Enrol Selected for ${MONTHS[monthIdx]} $enrolSession (${selected.size})", "btnEnrolSelected") {
                           if (selected.isEmpty()) {
                               Toast.makeText(context, "Select at least one teacher", Toast.LENGTH_SHORT).show()
                           } else {
-                              val n = db.enrol(selected.toList(), session, listOf(monthIdx + 1))
+                              val n = db.enrol(selected.toList(), enrolSession, listOf(monthIdx + 1))
                               selected.clear()
                               tick++
                               Toast.makeText(context, "$n enrolment(s) created", Toast.LENGTH_SHORT).show()
@@ -1211,7 +1259,7 @@ jobs:
                               if (selected.isEmpty()) {
                                   Toast.makeText(context, "Select at least one teacher", Toast.LENGTH_SHORT).show()
                               } else {
-                                  val n = db.enrol(selected.toList(), session, (1..12).toList())
+                                  val n = db.enrol(selected.toList(), enrolSession, (1..12).toList())
                                   selected.clear()
                                   tick++
                                   Toast.makeText(context, "$n enrolment(s) created", Toast.LENGTH_SHORT).show()
@@ -1219,6 +1267,101 @@ jobs:
                           },
                           modifier = Modifier.fillMaxWidth()
                       ) { Text("Enrol Selected for All 12 Months") }
+                  }
+              }
+          }
+
+          // =====================================================================
+          // PROMOTE ATTENDANCE SESSION  (table 2 -> table 2)
+          // =====================================================================
+          @Composable
+          fun PromoteScreen(db: DatabaseHelper, onBack: () -> Unit) {
+              val context = LocalContext.current
+              var fromSession by remember { mutableStateOf("") }
+              var fromMonthIdx by remember { mutableIntStateOf(0) }
+              var toSession by remember { mutableStateOf("") }
+              var toMonthIdx by remember { mutableIntStateOf(0) }
+              var tick by remember { mutableIntStateOf(0) }
+              val selected = remember { mutableStateListOf<Long>() }
+              val validFrom = isValidSession(fromSession)
+              val validTo = isValidSession(toSession)
+
+              // 1) rows of tblAttendanceEnrollment for the current session + month
+              // 2) their foreign keys are used to fetch name / father-husband from tblTeachers (joined in one query)
+              val source = remember(fromSession, fromMonthIdx, tick) {
+                  if (validFrom) db.getEnrolledTeachers(fromSession, fromMonthIdx + 1) else emptyList()
+              }
+              val alreadyInTarget = remember(toSession, toMonthIdx, tick) {
+                  if (validTo) db.getEnrolledIds(toSession, toMonthIdx + 1) else emptySet()
+              }
+
+              LaunchedEffect(fromSession, fromMonthIdx, toSession, toMonthIdx, tick) {
+                  selected.clear()
+                  if (validTo) {
+                      selected.addAll(source.filter { it.recordId !in alreadyInTarget }.map { it.recordId })
+                  }
+              }
+
+              ScreenFrame("Promote Attendance Session", onBack) {
+                  Text("1. Current enrolment (filter)", fontWeight = FontWeight.Bold)
+                  SessionField(fromSession, { fromSession = it }, "Current Session (0000/00)")
+                  DropdownField("Current Month", MONTHS, fromMonthIdx) { fromMonthIdx = it }
+
+                  Text("2. Promote to", fontWeight = FontWeight.Bold)
+                  SessionField(toSession, { toSession = it }, "Next Session (0000/00)")
+                  DropdownField("Next Month", MONTHS, toMonthIdx) { toMonthIdx = it }
+
+                  if (!validFrom) {
+                      Text("Type a complete current session (for example 2026/27).", color = Color.Gray)
+                  } else if (source.isEmpty()) {
+                      Text("No teachers are enrolled for ${MONTHS[fromMonthIdx]} $fromSession.", color = Color.Gray)
+                  } else {
+                      Text("3. Teachers enrolled in ${MONTHS[fromMonthIdx]} $fromSession (${source.size})", fontWeight = FontWeight.Bold)
+                      if (!validTo) {
+                          Text("Type a complete next session to enable promotion.", color = Color.Gray)
+                      }
+                      source.forEach { t ->
+                          val already = validTo && t.recordId in alreadyInTarget
+                          Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                              Checkbox(
+                                  checked = already || t.recordId in selected,
+                                  enabled = validTo && !already,
+                                  onCheckedChange = { c ->
+                                      if (c) selected.add(t.recordId) else selected.remove(t.recordId)
+                                  }
+                              )
+                              Column {
+                                  Text(t.name, fontWeight = FontWeight.SemiBold)
+                                  Text(
+                                      t.fatherName + if (already) "   ✔ already in ${MONTHS[toMonthIdx]} $toSession" else "",
+                                      color = if (already) Color(0xFF2E7D32) else Color.Gray
+                                  )
+                              }
+                          }
+                      }
+
+                      if (validTo) {
+                          OutlinedButton(
+                              onClick = {
+                                  selected.clear()
+                                  selected.addAll(source.filter { it.recordId !in alreadyInTarget }.map { it.recordId })
+                              },
+                              modifier = Modifier.fillMaxWidth()
+                          ) { Text("Select All Not Yet Promoted") }
+
+                          MenuButton(
+                              "Save: Promote ${selected.size} to ${MONTHS[toMonthIdx]} $toSession",
+                              "btnSavePromotion"
+                          ) {
+                              if (selected.isEmpty()) {
+                                  Toast.makeText(context, "Nothing to promote", Toast.LENGTH_SHORT).show()
+                              } else {
+                                  val n = db.enrol(selected.toList(), toSession, listOf(toMonthIdx + 1))
+                                  tick++
+                                  Toast.makeText(context, "$n teacher(s) promoted", Toast.LENGTH_SHORT).show()
+                              }
+                          }
+                      }
                   }
               }
           }
@@ -1699,7 +1842,7 @@ jobs:
           import androidx.compose.runtime.*
 
           enum class Screen {
-              DASHBOARD, ADD_TEACHER, ENROL, ATTENDANCE, PRINT, DELETE_TEACHER, DELETE_ATTENDANCE, REPORT
+              DASHBOARD, ADD_TEACHER, ENROL, PROMOTE, ATTENDANCE, PRINT, DELETE_TEACHER, DELETE_ATTENDANCE, REPORT
           }
 
           class MainActivity : ComponentActivity() {
@@ -1723,6 +1866,7 @@ jobs:
                   Screen.DASHBOARD -> DashboardScreen(db) { screen = it }
                   Screen.ADD_TEACHER -> AddTeacherScreen(db) { screen = Screen.DASHBOARD }
                   Screen.ENROL -> EnrolScreen(db) { screen = Screen.DASHBOARD }
+                  Screen.PROMOTE -> PromoteScreen(db) { screen = Screen.DASHBOARD }
                   Screen.ATTENDANCE -> TakeAttendanceScreen(db) { screen = Screen.DASHBOARD }
                   Screen.PRINT -> PrintAttendanceScreen(db) { screen = Screen.DASHBOARD }
                   Screen.DELETE_TEACHER -> DeleteTeacherScreen(db) { screen = Screen.DASHBOARD }
