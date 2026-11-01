@@ -23,9 +23,13 @@ jobs:
         with:
           gradle-version: '8.6'
 
+      - name: Accept Android SDK Licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
       - name: Clean and Generate Pristine Android Project
         run: |
-          rm -rf app build.gradle* settings.gradle* local.properties
+          # 0. Clean any conflicting files from previous runs
+          rm -rf app build.gradle* settings.gradle*
 
           mkdir -p app/src/main/java/com/school/teacherrecords
           mkdir -p app/src/main/res/xml
@@ -52,13 +56,19 @@ jobs:
 
           # 2. Root build.gradle
           cat << 'EOF' > build.gradle
-          plugins {
-              id 'com.android.application' version '8.2.2' apply false
-              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.2.2'
+                  classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22'
+              }
           }
           EOF
 
-          # 3. gradle.properties
+          # 2b. gradle.properties
           cat << 'EOF' > gradle.properties
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           android.useAndroidX=true
@@ -66,12 +76,10 @@ jobs:
           android.nonTransitiveRClass=true
           EOF
 
-          # 4. app/build.gradle
+          # 3. app/build.gradle
           cat << 'EOF' > app/build.gradle
-          plugins {
-              id 'com.android.application'
-              id 'org.jetbrains.kotlin.android'
-          }
+          apply plugin: 'com.android.application'
+          apply plugin: 'kotlin-android'
 
           android {
               namespace 'com.school.teacherrecords'
@@ -109,14 +117,12 @@ jobs:
               implementation 'androidx.activity:activity-compose:1.8.2'
               implementation platform('androidx.compose:compose-bom:2024.02.00')
               implementation 'androidx.compose.ui:ui'
-              implementation 'androidx.compose.foundation:foundation'
               implementation 'androidx.compose.material3:material3'
-              implementation 'androidx.compose.material:material-icons-core'
               implementation 'com.google.code.gson:gson:2.10.1'
           }
           EOF
 
-          # 5. AndroidManifest.xml
+          # 4. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -149,7 +155,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. file_paths.xml
+          # 5. file_paths.xml
           cat << 'EOF' > app/src/main/res/xml/file_paths.xml
           <?xml version="1.0" encoding="utf-8"?>
           <paths xmlns:android="http://schemas.android.com/apk/res/android">
@@ -157,7 +163,7 @@ jobs:
           </paths>
           EOF
 
-          # 7. DatabaseHelper.kt
+          # 6. DatabaseHelper.kt (three related tables)
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/DatabaseHelper.kt
           package com.school.teacherrecords
 
@@ -167,6 +173,7 @@ jobs:
           import android.database.sqlite.SQLiteDatabase
           import android.database.sqlite.SQLiteOpenHelper
 
+          // ---------- Row models ----------
           data class Teacher(
               val recordId: Long,
               val name: String,
@@ -190,13 +197,7 @@ jobs:
               val leave: Int
           )
 
-          data class PrintRow(
-              val date: String,
-              val name: String,
-              val fatherName: String,
-              val status: String
-          )
-
+          // ---------- Backup models ----------
           data class TeacherRow(val recordId: Long, val name: String, val fatherName: String, val appointmentSession: String)
           data class EnrollmentRow(val enrollmentId: Long, val teacherId: Long, val session: String, val month: Int)
           data class AttendanceRow(val attendanceId: Long, val teacherId: Long, val enrollmentId: Long, val date: String, val status: String)
@@ -215,6 +216,7 @@ jobs:
               }
 
               override fun onCreate(db: SQLiteDatabase) {
+                  // Table 1: basic information
                   db.execSQL("""
                       CREATE TABLE tblTeachers (
                           RecordID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,6 +226,7 @@ jobs:
                       )
                   """.trimIndent())
 
+                  // Table 2: attendance enrolment. One row per teacher + session + month (unique together)
                   db.execSQL("""
                       CREATE TABLE tblAttendanceEnrollment (
                           EnrollmentID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,10 +237,7 @@ jobs:
                       )
                   """.trimIndent())
 
-                  createRecordsTable(db)
-              }
-
-              private fun createRecordsTable(db: SQLiteDatabase) {
+                  // Table 3: only absent / late / half day / leave. Full date (yyyy-MM-dd), unique per enrolment + date
                   db.execSQL("""
                       CREATE TABLE tblAttendanceRecords (
                           AttendanceID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -245,18 +245,20 @@ jobs:
                           AttendanceEnrollmentIDFK INTEGER NOT NULL REFERENCES tblAttendanceEnrollment(EnrollmentID) ON DELETE CASCADE,
                           AttendanceDate TEXT NOT NULL,
                           AttendanceStatus TEXT NOT NULL,
-                          UNIQUE (AttendanceRecordIDFK, AttendanceDate, AttendanceStatus)
+                          UNIQUE (AttendanceEnrollmentIDFK, AttendanceDate)
                       )
                   """.trimIndent())
               }
 
               override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-                  if (oldVersion < 2) {
-                      db.execSQL("DROP TABLE IF EXISTS tblAttendanceRecords")
-                      createRecordsTable(db)
-                  }
+                  // Version 1 had a day number instead of a full date: rebuild the tables
+                  db.execSQL("DROP TABLE IF EXISTS tblAttendanceRecords")
+                  db.execSQL("DROP TABLE IF EXISTS tblAttendanceEnrollment")
+                  db.execSQL("DROP TABLE IF EXISTS tblTeachers")
+                  onCreate(db)
               }
 
+              // ---------- Counts ----------
               fun getCounts(): Triple<Int, Int, Int> {
                   val db = readableDatabase
                   return Triple(
@@ -266,6 +268,7 @@ jobs:
                   )
               }
 
+              // ---------- Table 1: teachers ----------
               fun getTeachers(sessionPrefix: String): List<Teacher> {
                   val list = mutableListOf<Teacher>()
                   val sql = "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers" +
@@ -280,6 +283,7 @@ jobs:
                   return list
               }
 
+              // Teachers appointed in or before the given session
               fun getEligibleTeachers(session: String): List<Teacher> {
                   val list = mutableListOf<Teacher>()
                   val sql = "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers " +
@@ -310,6 +314,7 @@ jobs:
                   writableDatabase.update("tblTeachers", v, "RecordID = ?", arrayOf(recordId.toString()))
               }
 
+              // Deletes the teacher AND all dependent rows in table 2 and table 3
               fun deleteTeacher(recordId: Long) {
                   val db = writableDatabase
                   val id = arrayOf(recordId.toString())
@@ -324,6 +329,7 @@ jobs:
                   }
               }
 
+              // ---------- Table 2: enrolment ----------
               fun enrol(recordIds: List<Long>, session: String, months: List<Int>): Int {
                   var added = 0
                   val db = writableDatabase
@@ -373,6 +379,7 @@ jobs:
                   return list
               }
 
+              // Teachers enrolled in at least one month of the session
               fun getTeachersEnrolledInSession(session: String): List<Teacher> {
                   val list = mutableListOf<Teacher>()
                   val sql = "SELECT DISTINCT t.RecordID, t.TeacherName, t.FatherHusbandName, t.AppointmentSession " +
@@ -386,29 +393,33 @@ jobs:
                   return list
               }
 
-              fun getAttendanceForDate(session: String, month: Int, date: String): Map<Long, String> {
+              // ---------- Table 3: attendance records ----------
+              // Returns enrollmentId -> status for one full date (yyyy-MM-dd)
+              fun getAttendanceForDate(session: String, date: String): Map<Long, String> {
                   val map = mutableMapOf<Long, String>()
                   val sql = "SELECT r.AttendanceEnrollmentIDFK, r.AttendanceStatus " +
                       "FROM tblAttendanceRecords r JOIN tblAttendanceEnrollment e ON e.EnrollmentID = r.AttendanceEnrollmentIDFK " +
-                      "WHERE e.AttendanceEnrollmentSession = ? AND e.AttendanceEnrollmentMonth = ? AND r.AttendanceDate = ?"
-                  readableDatabase.rawQuery(sql, arrayOf(session, month.toString(), date)).use { c ->
+                      "WHERE e.AttendanceEnrollmentSession = ? AND r.AttendanceDate = ?"
+                  readableDatabase.rawQuery(sql, arrayOf(session, date)).use { c ->
                       while (c.moveToNext()) map[c.getLong(0)] = c.getString(1)
                   }
                   return map
               }
 
-              fun saveAttendanceDay(date: String, enrolled: List<EnrolledTeacher>, statuses: Map<Long, String>) {
+              // "P" (present) removes any record for that date; other statuses are stored
+              fun saveAttendanceDate(date: String, enrolled: List<EnrolledTeacher>, statuses: Map<Long, String>) {
                   val db = writableDatabase
                   db.beginTransaction()
                   try {
                       for (t in enrolled) {
-                          val st = statuses[t.enrollmentId] ?: ST_PRESENT
-                          db.delete(
-                              "tblAttendanceRecords",
-                              "AttendanceEnrollmentIDFK = ? AND AttendanceDate = ?",
-                              arrayOf(t.enrollmentId.toString(), date)
-                          )
-                          if (st != ST_PRESENT) {
+                          val st = statuses[t.enrollmentId] ?: "P"
+                          if (st == "P") {
+                              db.delete(
+                                  "tblAttendanceRecords",
+                                  "AttendanceEnrollmentIDFK = ? AND AttendanceDate = ?",
+                                  arrayOf(t.enrollmentId.toString(), date)
+                              )
+                          } else {
                               val v = ContentValues().apply {
                                   put("AttendanceRecordIDFK", t.recordId)
                                   put("AttendanceEnrollmentIDFK", t.enrollmentId)
@@ -424,6 +435,7 @@ jobs:
                   }
               }
 
+              // Deletes ONLY attendance records of one teacher (basic info and enrolments stay)
               fun deleteAttendanceRecords(recordId: Long, session: String, month: Int?): Int {
                   val sub = "SELECT EnrollmentID FROM tblAttendanceEnrollment WHERE AttendanceEnrollmentSession = ?" +
                       (if (month != null) " AND AttendanceEnrollmentMonth = ?" else "")
@@ -436,6 +448,7 @@ jobs:
                   )
               }
 
+              // All records of a session between two full dates (inclusive), used for printing
               fun getAttendanceBetween(session: String, fromDate: String, toDate: String): List<PrintRow> {
                   val list = mutableListOf<PrintRow>()
                   val sql = "SELECT r.AttendanceDate, t.TeacherName, t.FatherHusbandName, r.AttendanceStatus " +
@@ -452,6 +465,7 @@ jobs:
                   return list
               }
 
+              // ---------- Report ----------
               fun getMonthlyReport(session: String, month: Int): List<ReportRow> {
                   val list = mutableListOf<ReportRow>()
                   val sql = "SELECT t.TeacherName, t.FatherHusbandName, " +
@@ -472,6 +486,7 @@ jobs:
                   return list
               }
 
+              // ---------- Backup / restore (all three tables) ----------
               fun getBackup(): BackupData {
                   val db = readableDatabase
                   val teachers = mutableListOf<TeacherRow>()
@@ -495,6 +510,7 @@ jobs:
                   return BackupData(3, teachers, enrollments, attendance)
               }
 
+              // Replaces ALL current data with the backup
               fun restoreBackup(data: BackupData) {
                   val db = writableDatabase
                   db.beginTransaction()
@@ -538,14 +554,13 @@ jobs:
           }
           EOF
 
-          # 8. Common.kt
+          # 7. Common.kt (constants, session mask, date helpers, shared controls)
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/Common.kt
           @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 
           package com.school.teacherrecords
 
           import android.app.DatePickerDialog
-          import android.content.Context
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.text.KeyboardOptions
@@ -553,10 +568,13 @@ jobs:
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.text.input.KeyboardType
           import androidx.compose.ui.unit.dp
+          import java.text.SimpleDateFormat
           import java.util.Calendar
+          import java.util.Date
           import java.util.Locale
 
           val MONTHS = listOf(
@@ -570,48 +588,45 @@ jobs:
           const val ST_HALF = "HALF_DAY"
           const val ST_LEAVE = "LEAVE"
 
-          fun statusLabel(code: String): String = when (code) {
-              ST_ABSENT -> "Absent"
-              ST_LATE -> "Late"
-              ST_HALF -> "Half Day"
-              ST_LEAVE -> "Leave"
-              else -> code
-          }
-
-          fun isLeapYear(y: Int): Boolean = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-
-          fun daysInMonth(year: Int, month: Int): Int = when (month) {
-              2 -> if (isLeapYear(year)) 29 else 28
-              4, 6, 9, 11 -> 30
-              else -> 31
-          }
-
-          fun toIso(y: Int, m: Int, d: Int): String = String.format(Locale.US, "%04d-%02d-%02d", y, m, d)
-
-          fun isoToDisplay(iso: String): String =
-              iso.substring(8, 10) + "-" + iso.substring(5, 7) + "-" + iso.substring(0, 4)
-
-          fun todayIso(): String {
-              val c = Calendar.getInstance()
-              return toIso(c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH))
-          }
+          // ---------- Date helpers (stored as yyyy-MM-dd, shown as dd-MM-yyyy) ----------
+          fun todayIso(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
 
           fun firstOfMonthIso(): String {
               val c = Calendar.getInstance()
-              return toIso(c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1, 1)
+              c.set(Calendar.DAY_OF_MONTH, 1)
+              return SimpleDateFormat("yyyy-MM-dd", Locale.US).format(c.time)
           }
 
-          fun pickDate(context: Context, currentIso: String, onPicked: (String) -> Unit) {
-              val y = currentIso.substring(0, 4).toInt()
-              val m = currentIso.substring(5, 7).toInt() - 1
-              val d = currentIso.substring(8, 10).toInt()
-              DatePickerDialog(
-                  context,
-                  { _, yy, mm, dd -> onPicked(toIso(yy, mm + 1, dd)) },
-                  y, m, d
-              ).show()
+          fun displayDate(iso: String): String {
+              val p = iso.split("-")
+              return if (p.size == 3) "${p[2]}-${p[1]}-${p[0]}" else iso
           }
 
+          fun monthOfIso(iso: String): Int = iso.substring(5, 7).toInt()
+
+          @Composable
+          fun DateField(label: String, value: String, onChange: (String) -> Unit) {
+              val context = LocalContext.current
+              OutlinedButton(
+                  onClick = {
+                      val cal = Calendar.getInstance()
+                      val p = value.split("-")
+                      if (p.size == 3) {
+                          cal.set(p[0].toInt(), p[1].toInt() - 1, p[2].toInt())
+                      }
+                      DatePickerDialog(
+                          context,
+                          { _, y, m, d -> onChange(String.format(Locale.US, "%04d-%02d-%02d", y, m + 1, d)) },
+                          cal.get(Calendar.YEAR),
+                          cal.get(Calendar.MONTH),
+                          cal.get(Calendar.DAY_OF_MONTH)
+                      ).show()
+                  },
+                  modifier = Modifier.fillMaxWidth()
+              ) { Text("$label: ${displayDate(value)}") }
+          }
+
+          // ---------- Session mask 0000/00 ----------
           fun formatSessionInput(raw: String): String {
               val d = raw.filter { it.isDigit() }.take(6)
               return if (d.length > 4) d.substring(0, 4) + "/" + d.substring(4) else d
@@ -706,16 +721,16 @@ jobs:
           }
           EOF
 
-          # 9. PrintReport.kt
-          cat << 'EOF' > app/src/main/java/com/school/teacherrecords/PrintReport.kt
+          # 8. AttendancePrint.kt (A4 print layout, system print + image export)
+          cat << 'EOF' > app/src/main/java/com/school/teacherrecords/AttendancePrint.kt
           package com.school.teacherrecords
 
           import android.content.Context
+          import android.graphics.Bitmap
           import android.graphics.Canvas
           import android.graphics.Color
           import android.graphics.Paint
           import android.graphics.Typeface
-          import android.graphics.pdf.PdfDocument
           import android.os.Bundle
           import android.os.CancellationSignal
           import android.os.ParcelFileDescriptor
@@ -724,250 +739,225 @@ jobs:
           import android.print.PrintDocumentAdapter
           import android.print.PrintDocumentInfo
           import android.print.PrintManager
+          import android.print.pdf.PrintedPdfDocument
+          import android.text.TextPaint
+          import android.text.TextUtils
           import java.io.File
-          import java.io.FileInputStream
           import java.io.FileOutputStream
-          import java.text.SimpleDateFormat
-          import java.util.Date
-          import java.util.Locale
+          import java.io.IOException
 
           const val SCHOOL_NAME = "Islamic International Model School"
 
-          class AttendancePrintReport {
-              private val pageW = 595
-              private val pageH = 842
-              private val margin = 36f
-              private val doc = PdfDocument()
-              private var page: PdfDocument.Page? = null
-              private var canvas: Canvas? = null
-              private var pageNum = 0
-              private var y = 0f
-              private var detailHeader = false
-              private var session = ""
-              private var fromIso = ""
-              private var toIso = ""
+          data class PrintRow(val date: String, val name: String, val fatherName: String, val status: String)
 
-              private val schoolPaint = Paint().apply {
-                  color = Color.BLACK; textSize = 18f; typeface = Typeface.DEFAULT_BOLD
-                  textAlign = Paint.Align.CENTER; isAntiAlias = true
+          fun statusLabel(s: String): String = when (s) {
+              ST_ABSENT -> "Absent"
+              ST_LATE -> "Late"
+              ST_HALF -> "Half Day"
+              ST_LEAVE -> "Leave"
+              else -> s
+          }
+
+          // Lays records out on A4 portrait pages (595 x 842 points)
+          class AttendanceReportLayout(
+              val session: String,
+              val fromIso: String,
+              val toIso: String,
+              private val rows: List<PrintRow>
+          ) {
+              companion object {
+                  const val W = 595
+                  const val H = 842
+                  const val ROWS_PER_PAGE = 36
               }
-              private val titlePaint = Paint().apply {
-                  color = Color.DKGRAY; textSize = 12f; textAlign = Paint.Align.CENTER; isAntiAlias = true
+
+              val pages: List<List<PrintRow>>
+
+              init {
+                  val chunks = rows.chunked(ROWS_PER_PAGE).toMutableList()
+                  // keep room for the totals block on the last page
+                  if (chunks.isEmpty() || chunks.last().size > ROWS_PER_PAGE - 6) chunks.add(emptyList())
+                  pages = chunks
               }
-              private val infoPaint = Paint().apply {
-                  color = Color.BLACK; textSize = 10f; textAlign = Paint.Align.CENTER; isAntiAlias = true
-              }
-              private val boldPaint = Paint().apply {
-                  color = Color.BLACK; textSize = 10f; typeface = Typeface.DEFAULT_BOLD; isAntiAlias = true
-              }
-              private val textPaint = Paint().apply {
-                  color = Color.BLACK; textSize = 10f; isAntiAlias = true
-              }
-              private val footPaint = Paint().apply {
-                  color = Color.GRAY; textSize = 9f; textAlign = Paint.Align.CENTER; isAntiAlias = true
-              }
+
+              private fun tp(size: Float, bold: Boolean = false, align: Paint.Align = Paint.Align.LEFT, color: Int = Color.BLACK) =
+                  TextPaint().apply {
+                      isAntiAlias = true
+                      textSize = size
+                      this.color = color
+                      textAlign = align
+                      if (bold) typeface = Typeface.DEFAULT_BOLD
+                  }
+
+              private val schoolPaint = tp(18f, true, Paint.Align.CENTER)
+              private val titlePaint = tp(12f, true, Paint.Align.CENTER)
+              private val infoPaint = tp(10.5f, false, Paint.Align.CENTER, Color.DKGRAY)
+              private val headPaint = tp(10.5f, true)
+              private val textPaint = tp(10.5f)
+              private val footLeft = tp(9f, false, Paint.Align.LEFT, Color.GRAY)
+              private val footRight = tp(9f, false, Paint.Align.RIGHT, Color.GRAY)
               private val linePaint = Paint().apply { color = Color.BLACK; strokeWidth = 1f }
               private val bgPaint = Paint().apply { color = Color.rgb(224, 224, 224) }
 
-              private val colNo = margin
-              private val colDate = margin + 28f
-              private val colName = margin + 100f
-              private val colFather = margin + 265f
-              private val colStatus = margin + 420f
+              private fun fit(s: String, p: TextPaint, w: Float): String =
+                  TextUtils.ellipsize(s, p, w, TextUtils.TruncateAt.END).toString()
 
-              private val sumName = margin
-              private val sumFather = margin + 170f
-              private val sumA = margin + 340f
-              private val sumL = margin + 390f
-              private val sumH = margin + 430f
-              private val sumV = margin + 485f
+              fun drawPage(c: Canvas, index: Int) {
+                  val margin = 36f
+                  val right = W - margin
+                  val xSr = margin + 4f
+                  val xDate = 72f
+                  val xName = 150f
+                  val xFather = 310f
+                  val xStatus = 490f
 
-              private fun fit(text: String, paint: Paint, maxW: Float): String {
-                  if (paint.measureText(text) <= maxW) return text
-                  var s = text
-                  while (s.isNotEmpty() && paint.measureText("$s...") > maxW) s = s.dropLast(1)
-                  return "$s..."
-              }
-
-              private fun finishPage() {
-                  val p = page ?: return
-                  canvas!!.drawText("Page $pageNum", pageW / 2f, pageH - 20f, footPaint)
-                  doc.finishPage(p)
-                  page = null
-              }
-
-              private fun newPage() {
-                  finishPage()
-                  pageNum++
-                  val info = PdfDocument.PageInfo.Builder(pageW, pageH, pageNum).create()
-                  val p = doc.startPage(info)
-                  page = p
-                  val c = p.canvas
-                  canvas = c
-                  c.drawText(SCHOOL_NAME, pageW / 2f, 46f, schoolPaint)
-                  c.drawText("Teacher Attendance Report", pageW / 2f, 64f, titlePaint)
+                  // Header on EVERY page
+                  c.drawText(SCHOOL_NAME, W / 2f, 46f, schoolPaint)
+                  c.drawText("Teacher Attendance Report", W / 2f, 66f, titlePaint)
                   c.drawText(
-                      "Session: $session     From: ${isoToDisplay(fromIso)}     To: ${isoToDisplay(toIso)}",
-                      pageW / 2f, 80f, infoPaint
+                      "Session: $session     From: ${displayDate(fromIso)}     To: ${displayDate(toIso)}",
+                      W / 2f, 84f, infoPaint
                   )
-                  c.drawLine(margin, 90f, pageW - margin, 90f, linePaint)
-                  y = 112f
-              }
+                  c.drawLine(margin, 94f, right, 94f, linePaint)
 
-              private fun drawDetailHeader() {
-                  val c = canvas!!
-                  c.drawRect(margin, y - 12f, pageW - margin, y + 6f, bgPaint)
-                  c.drawText("#", colNo + 2f, y, boldPaint)
-                  c.drawText("Date", colDate, y, boldPaint)
-                  c.drawText("Teacher Name", colName, y, boldPaint)
-                  c.drawText("Father / Husband", colFather, y, boldPaint)
-                  c.drawText("Status", colStatus, y, boldPaint)
-                  y += 20f
-              }
+                  // Column headings
+                  c.drawRect(margin, 100f, right, 120f, bgPaint)
+                  c.drawText("Sr", xSr, 114f, headPaint)
+                  c.drawText("Date", xDate, 114f, headPaint)
+                  c.drawText("Teacher Name", xName, 114f, headPaint)
+                  c.drawText("Father / Husband", xFather, 114f, headPaint)
+                  c.drawText("Status", xStatus, 114f, headPaint)
 
-              private fun ensure(h: Float) {
-                  if (y + h > pageH - 50f) {
-                      newPage()
-                      if (detailHeader) drawDetailHeader()
+                  var y = 136f
+                  val chunk = pages[index]
+                  chunk.forEachIndexed { i, r ->
+                      c.drawText("${index * ROWS_PER_PAGE + i + 1}", xSr, y, textPaint)
+                      c.drawText(displayDate(r.date), xDate, y, textPaint)
+                      c.drawText(fit(r.name, textPaint, xFather - xName - 8f), xName, y, textPaint)
+                      c.drawText(fit(r.fatherName, textPaint, xStatus - xFather - 8f), xFather, y, textPaint)
+                      c.drawText(statusLabel(r.status), xStatus, y, textPaint)
+                      y += 18f
                   }
-              }
 
-              fun build(file: File, session: String, fromIso: String, toIso: String, rows: List<PrintRow>): Int {
-                  this.session = session
-                  this.fromIso = fromIso
-                  this.toIso = toIso
-                  newPage()
-
-                  if (rows.isEmpty()) {
-                      canvas!!.drawText(
-                          "No absent / late / half day / leave records found for the selected session and dates.",
-                          margin, y, textPaint
-                      )
-                      y += 20f
-                  } else {
-                      detailHeader = true
-                      drawDetailHeader()
-                      rows.forEachIndexed { i, r ->
-                          ensure(18f)
-                          val c = canvas!!
-                          c.drawText("${i + 1}", colNo + 2f, y, textPaint)
-                          c.drawText(isoToDisplay(r.date), colDate, y, textPaint)
-                          c.drawText(fit(r.name, textPaint, colFather - colName - 6f), colName, y, textPaint)
-                          c.drawText(fit(r.fatherName, textPaint, colStatus - colFather - 6f), colFather, y, textPaint)
-                          c.drawText(statusLabel(r.status), colStatus, y, textPaint)
+                  if (index == pages.size - 1) {
+                      if (rows.isEmpty()) {
+                          c.drawText("No attendance records found for the selected filter.", xSr, y, textPaint)
+                      } else {
+                          y += 6f
+                          c.drawLine(margin, y, right, y, linePaint)
+                          y += 18f
+                          c.drawText("Total records: ${rows.size}", xSr, y, headPaint)
                           y += 16f
-                      }
-                      detailHeader = false
-
-                      ensure(60f)
-                      y += 14f
-                      canvas!!.drawText("Summary", margin, y, boldPaint)
-                      y += 14f
-                      canvas!!.drawRect(margin, y - 12f, pageW - margin, y + 6f, bgPaint)
-                      canvas!!.drawText("Teacher Name", sumName + 2f, y, boldPaint)
-                      canvas!!.drawText("Father / Husband", sumFather, y, boldPaint)
-                      canvas!!.drawText("Absent", sumA, y, boldPaint)
-                      canvas!!.drawText("Late", sumL, y, boldPaint)
-                      canvas!!.drawText("Half Day", sumH, y, boldPaint)
-                      canvas!!.drawText("Leave", sumV, y, boldPaint)
-                      y += 20f
-
-                      val groups = rows.groupBy { it.name to it.fatherName }
-                          .toList()
-                          .sortedBy { it.first.first.lowercase() }
-                      for ((key, list) in groups) {
-                          ensure(18f)
-                          val c = canvas!!
-                          c.drawText(fit(key.first, textPaint, sumFather - sumName - 6f), sumName + 2f, y, textPaint)
-                          c.drawText(fit(key.second, textPaint, sumA - sumFather - 6f), sumFather, y, textPaint)
-                          c.drawText("${list.count { it.status == ST_ABSENT }}", sumA, y, textPaint)
-                          c.drawText("${list.count { it.status == ST_LATE }}", sumL, y, textPaint)
-                          c.drawText("${list.count { it.status == ST_HALF }}", sumH, y, textPaint)
-                          c.drawText("${list.count { it.status == ST_LEAVE }}", sumV, y, textPaint)
-                          y += 16f
+                          c.drawText(
+                              "Absent: ${rows.count { it.status == ST_ABSENT }}     " +
+                                  "Late: ${rows.count { it.status == ST_LATE }}     " +
+                                  "Half Day: ${rows.count { it.status == ST_HALF }}     " +
+                                  "Leave: ${rows.count { it.status == ST_LEAVE }}",
+                              xSr, y, textPaint
+                          )
                       }
                   }
 
-                  ensure(46f)
-                  y += 12f
-                  canvas!!.drawLine(margin, y, pageW - margin, y, linePaint)
-                  y += 18f
-                  val today = SimpleDateFormat("dd MMMM yyyy", Locale.ENGLISH).format(Date())
-                  canvas!!.drawText("Printed on: $today", margin, y, boldPaint)
-
-                  finishPage()
-                  FileOutputStream(file).use { doc.writeTo(it) }
-                  val total = pageNum
-                  doc.close()
-                  return total
+                  // Footer
+                  c.drawText("Printed on: ${displayDate(todayIso())}", margin, H - 20f, footLeft)
+                  c.drawText("Page ${index + 1} of ${pages.size}", right, H - 20f, footRight)
               }
           }
 
+          // ---------- System print (choose printer or "Save as PDF") ----------
           class AttendancePrintAdapter(
               private val context: Context,
-              private val jobTitle: String,
-              private val builder: (File) -> Int
+              private val report: AttendanceReportLayout
           ) : PrintDocumentAdapter() {
 
-              private val file = File(context.cacheDir, "print_attendance.pdf")
+              private var attrs: PrintAttributes? = null
 
               override fun onLayout(
                   oldAttributes: PrintAttributes?,
-                  newAttributes: PrintAttributes?,
+                  newAttributes: PrintAttributes,
                   cancellationSignal: CancellationSignal?,
-                  callback: LayoutResultCallback?,
+                  callback: LayoutResultCallback,
                   extras: Bundle?
               ) {
                   if (cancellationSignal?.isCanceled == true) {
-                      callback?.onLayoutCancelled()
+                      callback.onLayoutCancelled()
                       return
                   }
-                  try {
-                      val pages = builder(file)
-                      val info = PrintDocumentInfo.Builder(jobTitle)
-                          .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
-                          .setPageCount(pages)
-                          .build()
-                      callback?.onLayoutFinished(info, true)
-                  } catch (e: Exception) {
-                      callback?.onLayoutFailed(e.message)
-                  }
+                  attrs = newAttributes
+                  val info = PrintDocumentInfo.Builder("Teacher_Attendance_Report.pdf")
+                      .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                      .setPageCount(report.pages.size)
+                      .build()
+                  callback.onLayoutFinished(info, true)
               }
 
               override fun onWrite(
                   pages: Array<out PageRange>?,
-                  destination: ParcelFileDescriptor?,
+                  destination: ParcelFileDescriptor,
                   cancellationSignal: CancellationSignal?,
-                  callback: WriteResultCallback?
+                  callback: WriteResultCallback
               ) {
+                  val a = attrs
+                  if (a == null) {
+                      callback.onWriteFailed("Layout missing")
+                      return
+                  }
+                  val doc = PrintedPdfDocument(context, a)
                   try {
-                      FileInputStream(file).use { input ->
-                          FileOutputStream(destination!!.fileDescriptor).use { output ->
-                              input.copyTo(output)
+                      for (i in report.pages.indices) {
+                          if (cancellationSignal?.isCanceled == true) {
+                              callback.onWriteCancelled()
+                              return
                           }
+                          val page = doc.startPage(i)
+                          val sc = page.info.pageWidth / AttendanceReportLayout.W.toFloat()
+                          page.canvas.scale(sc, sc)
+                          report.drawPage(page.canvas, i)
+                          doc.finishPage(page)
                       }
-                      callback?.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
-                  } catch (e: Exception) {
-                      callback?.onWriteFailed(e.message)
+                      doc.writeTo(FileOutputStream(destination.fileDescriptor))
+                      callback.onWriteFinished(arrayOf(PageRange.ALL_PAGES))
+                  } catch (e: IOException) {
+                      callback.onWriteFailed(e.toString())
+                  } finally {
+                      doc.close()
                   }
               }
           }
 
-          fun printAttendance(context: Context, session: String, fromIso: String, toIso: String, rows: List<PrintRow>) {
+          fun printAttendance(context: Context, report: AttendanceReportLayout) {
               val pm = context.getSystemService(Context.PRINT_SERVICE) as PrintManager
-              val title = "Teacher_Attendance_" + session.replace("/", "-")
-              val adapter = AttendancePrintAdapter(context, title) { file ->
-                  AttendancePrintReport().build(file, session, fromIso, toIso, rows)
+              val attrs = PrintAttributes.Builder()
+                  .setMediaSize(PrintAttributes.MediaSize.ISO_A4)
+                  .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
+                  .build()
+              pm.print("Teacher Attendance Report", AttendancePrintAdapter(context, report), attrs)
+          }
+
+          // ---------- Same report as JPG pages (for sharing in a group) ----------
+          fun renderAttendanceImages(context: Context, report: AttendanceReportLayout): List<File> {
+              val scale = 2.5f
+              val files = mutableListOf<File>()
+              for (i in report.pages.indices) {
+                  val bmp = Bitmap.createBitmap(
+                      (AttendanceReportLayout.W * scale).toInt(),
+                      (AttendanceReportLayout.H * scale).toInt(),
+                      Bitmap.Config.ARGB_8888
+                  )
+                  val c = Canvas(bmp)
+                  c.drawColor(Color.WHITE)
+                  c.scale(scale, scale)
+                  report.drawPage(c, i)
+                  val f = File(context.cacheDir, "Teacher_Attendance_p${i + 1}.jpg")
+                  FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+                  bmp.recycle()
+                  files.add(f)
               }
-              pm.print(
-                  title,
-                  adapter,
-                  PrintAttributes.Builder().setMediaSize(PrintAttributes.MediaSize.ISO_A4).build()
-              )
+              return files
           }
           EOF
 
-          # 10. Screens.kt
+          # 9. Screens.kt (all forms)
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/Screens.kt
           @file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 
@@ -1008,6 +998,9 @@ jobs:
               ) { Text(text) }
           }
 
+          // =====================================================================
+          // DASHBOARD
+          // =====================================================================
           @Composable
           fun DashboardScreen(db: DatabaseHelper, onNavigate: (Screen) -> Unit) {
               val counts = remember { db.getCounts() }
@@ -1041,7 +1034,7 @@ jobs:
                       MenuButton("Add New Teachers", "btnAddNewTeachers") { onNavigate(Screen.ADD_TEACHER) }
                       MenuButton("Enrol Teacher (for attendance)", "btnEnrolTeacher") { onNavigate(Screen.ENROL) }
                       MenuButton("Take Attendance", "btnTakeAttendance") { onNavigate(Screen.ATTENDANCE) }
-                      MenuButton("Print Attendance", "btnPrintAttendanceMenu") { onNavigate(Screen.PRINT) }
+                      MenuButton("Print Attendance", "btnPrintAttendance") { onNavigate(Screen.PRINT) }
                       MenuButton("Monthly Report / Backup / Restore", "btnReportsBackup") { onNavigate(Screen.REPORT) }
                       HorizontalDivider()
                       MenuButton("Delete Teacher", "btnDeleteTeacher", danger = true) { onNavigate(Screen.DELETE_TEACHER) }
@@ -1052,6 +1045,9 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // ADD / EDIT TEACHER  (table 1)
+          // =====================================================================
           @Composable
           fun AddTeacherScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1142,6 +1138,9 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // ENROL TEACHERS  (table 2)
+          // =====================================================================
           @Composable
           fun EnrolScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1224,38 +1223,28 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // TAKE ATTENDANCE  (table 3, full date)
+          // =====================================================================
           @Composable
           fun TakeAttendanceScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
               var session by remember { mutableStateOf("") }
-              var monthIdx by remember { mutableIntStateOf(0) }
-              var yearIdx by remember { mutableIntStateOf(0) }
-              var dayIdx by remember { mutableIntStateOf(0) }
+              var dateIso by remember { mutableStateOf(todayIso()) }
               var tick by remember { mutableIntStateOf(0) }
               val statuses = remember { mutableStateMapOf<Long, String>() }
               val valid = isValidSession(session)
+              val month = monthOfIso(dateIso)
 
-              val startYear = if (valid) session.substring(0, 4).toInt() else 0
-              val yearOptions = remember(session) {
-                  if (valid) listOf(startYear.toString(), (startYear + 1).toString()) else listOf("")
-              }
-              LaunchedEffect(monthIdx, session) { yearIdx = if (monthIdx >= 3) 0 else 1 }
-
-              val year = if (valid) startYear + minOf(yearIdx, 1) else 0
-              val maxDay = daysInMonth(year, monthIdx + 1)
-              val dayIndex = minOf(dayIdx, maxDay - 1)
-              val dayOptions = remember(maxDay) { (1..maxDay).map { it.toString() } }
-              val dateIso = if (valid) toIso(year, monthIdx + 1, dayIndex + 1) else ""
-
-              val enrolled = remember(session, monthIdx, tick) {
-                  if (valid) db.getEnrolledTeachers(session, monthIdx + 1) else emptyList()
+              val enrolled = remember(session, dateIso, tick) {
+                  if (valid) db.getEnrolledTeachers(session, month) else emptyList()
               }
 
-              LaunchedEffect(session, monthIdx, dateIso, tick) {
+              LaunchedEffect(session, dateIso, tick) {
                   statuses.clear()
                   if (valid) {
-                      val existing = db.getAttendanceForDate(session, monthIdx + 1, dateIso)
-                      db.getEnrolledTeachers(session, monthIdx + 1).forEach {
+                      val existing = db.getAttendanceForDate(session, dateIso)
+                      db.getEnrolledTeachers(session, monthOfIso(dateIso)).forEach {
                           statuses[it.enrollmentId] = existing[it.enrollmentId] ?: ST_PRESENT
                       }
                   }
@@ -1274,21 +1263,16 @@ jobs:
 
               ScreenFrame("Take Attendance", onBack) {
                   SessionField(session, { session = it }, "Attendance Session (0000/00)")
-                  DropdownField("Month", MONTHS, monthIdx) { monthIdx = it }
-                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                      DropdownField("Year", yearOptions, minOf(yearIdx, 1), { yearIdx = it }, Modifier.weight(1f))
-                      DropdownField("Day", dayOptions, dayIndex, { dayIdx = it }, Modifier.weight(1f))
-                  }
+                  DateField("Attendance Date", dateIso) { dateIso = it }
 
                   if (!valid) {
                       Text("Type a complete session (for example 2026/27).", color = Color.Gray)
                   } else if (enrolled.isEmpty()) {
                       Text(
-                          "No teachers are enrolled for ${MONTHS[monthIdx]} $session. Use Enrol Teacher first.",
+                          "No teachers are enrolled for ${MONTHS[month - 1]} $session. Use Enrol Teacher first.",
                           color = Color.Gray
                       )
                   } else {
-                      Text("Attendance date: ${isoToDisplay(dateIso)}", fontWeight = FontWeight.Bold)
                       Text(
                           "P = Present (nothing stored), A = Absent, L = Late, HD = Half Day, LV = Leave",
                           color = Color.Gray
@@ -1325,8 +1309,8 @@ jobs:
                           fontWeight = FontWeight.Bold
                       )
 
-                      MenuButton("Save Attendance for ${isoToDisplay(dateIso)}", "btnSaveAttendance") {
-                          db.saveAttendanceDay(dateIso, enrolled, statuses.toMap())
+                      MenuButton("Save Attendance for ${displayDate(dateIso)}", "btnSaveAttendance") {
+                          db.saveAttendanceDate(dateIso, enrolled, statuses.toMap())
                           tick++
                           Toast.makeText(context, "Attendance saved", Toast.LENGTH_SHORT).show()
                       }
@@ -1334,6 +1318,9 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // PRINT ATTENDANCE  (session + two dates from table 3)
+          // =====================================================================
           @Composable
           fun PrintAttendanceScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1348,56 +1335,57 @@ jobs:
 
               ScreenFrame("Print Attendance", onBack) {
                   SessionField(session, { session = it }, "Attendance Session (0000/00)")
-                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                      OutlinedButton(
-                          onClick = { pickDate(context, fromDate) { fromDate = it } },
-                          modifier = Modifier.weight(1f)
-                      ) { Text("From: ${isoToDisplay(fromDate)}") }
-                      OutlinedButton(
-                          onClick = { pickDate(context, toDate) { toDate = it } },
-                          modifier = Modifier.weight(1f)
-                      ) { Text("To: ${isoToDisplay(toDate)}") }
-                  }
-
-                  if (!rangeOk) {
-                      Text("The From date must not be after the To date.", color = RED)
-                  }
+                  DateField("From date", fromDate) { fromDate = it }
+                  DateField("To date", toDate) { toDate = it }
 
                   if (!valid) {
                       Text("Type a complete session (for example 2026/27).", color = Color.Gray)
-                  } else if (rangeOk) {
-                      Text("Records found: ${rows.size}", fontWeight = FontWeight.Bold)
-                      if (rows.isNotEmpty()) {
-                          Row(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .background(Color(0xFFE0E0E0))
-                                  .padding(8.dp)
-                          ) {
-                              Text("Date", Modifier.weight(2f), fontWeight = FontWeight.Bold)
-                              Text("Teacher", Modifier.weight(3f), fontWeight = FontWeight.Bold)
-                              Text("Status", Modifier.weight(2f), fontWeight = FontWeight.Bold)
-                          }
-                          rows.forEach { r ->
-                              Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
-                                  Text(isoToDisplay(r.date), Modifier.weight(2f))
-                                  Text(r.name, Modifier.weight(3f))
-                                  Text(statusLabel(r.status), Modifier.weight(2f))
-                              }
-                              HorizontalDivider()
-                          }
-                      }
-                      MenuButton("Print Attendance", "btnPrintAttendance") {
+                  } else if (!rangeOk) {
+                      Text("'From date' must not be after 'To date'.", color = RED)
+                  } else {
+                      Text("${rows.size} record(s) found", fontWeight = FontWeight.Bold)
+                      Text(
+                          "Absent ${rows.count { it.status == ST_ABSENT }}, " +
+                              "Late ${rows.count { it.status == ST_LATE }}, " +
+                              "Half Day ${rows.count { it.status == ST_HALF }}, " +
+                              "Leave ${rows.count { it.status == ST_LEAVE }}"
+                      )
+                  }
+
+                  MenuButton("Print", "btnPrintAttendanceNow") {
+                      if (!valid || !rangeOk || rows.isEmpty()) {
+                          Toast.makeText(context, "Nothing to print for this filter", Toast.LENGTH_SHORT).show()
+                      } else {
                           try {
-                              printAttendance(context, session, fromDate, toDate, rows)
+                              printAttendance(context, AttendanceReportLayout(session, fromDate, toDate, rows))
                           } catch (e: Exception) {
                               Toast.makeText(context, "Print failed: ${e.message}", Toast.LENGTH_LONG).show()
                           }
                       }
                   }
+                  OutlinedButton(
+                      onClick = {
+                          if (!valid || !rangeOk || rows.isEmpty()) {
+                              Toast.makeText(context, "Nothing to share for this filter", Toast.LENGTH_SHORT).show()
+                          } else {
+                              try {
+                                  val files = renderAttendanceImages(
+                                      context, AttendanceReportLayout(session, fromDate, toDate, rows)
+                                  )
+                                  shareImages(context, files)
+                              } catch (e: Exception) {
+                                  Toast.makeText(context, "Image failed: ${e.message}", Toast.LENGTH_LONG).show()
+                              }
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth()
+                  ) { Text("Share as Image") }
               }
           }
 
+          // =====================================================================
+          // DELETE TEACHER  (cascades to tables 2 and 3)
+          // =====================================================================
           @Composable
           fun DeleteTeacherScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1452,11 +1440,14 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // DELETE ATTENDANCE RECORDS OF ONE TEACHER  (table 3 only)
+          // =====================================================================
           @Composable
           fun DeleteAttendanceScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
               var session by remember { mutableStateOf("") }
-              var monthIdx by remember { mutableIntStateOf(0) }
+              var monthIdx by remember { mutableIntStateOf(0) }   // 0 = all months
               var selected by remember { mutableStateOf<Teacher?>(null) }
               var confirm by remember { mutableStateOf(false) }
               var tick by remember { mutableIntStateOf(0) }
@@ -1532,6 +1523,9 @@ jobs:
               }
           }
 
+          // =====================================================================
+          // MONTHLY REPORT + EXPORT + BACKUP / RESTORE
+          // =====================================================================
           @Composable
           fun ReportScreen(db: DatabaseHelper, onBack: () -> Unit) {
               val context = LocalContext.current
@@ -1642,6 +1636,7 @@ jobs:
               }
           }
 
+          // ---------- File helpers ----------
           private fun csvCell(s: String): String = "\"" + s.replace("\"", "\"\"") + "\""
 
           fun exportReportCsv(context: Context, session: String, month: Int, rows: List<ReportRow>) {
@@ -1678,9 +1673,21 @@ jobs:
               }
               context.startActivity(Intent.createChooser(intent, "Share File"))
           }
+
+          fun shareImages(context: Context, files: List<File>) {
+              val uris = ArrayList<Uri>(files.map {
+                  FileProvider.getUriForFile(context, "com.school.teacherrecords.fileprovider", it)
+              })
+              val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                  type = "image/jpeg"
+                  putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                  addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+              }
+              context.startActivity(Intent.createChooser(intent, "Share Attendance Report"))
+          }
           EOF
 
-          # 11. MainActivity.kt
+          # 10. MainActivity.kt (navigation)
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/MainActivity.kt
           package com.school.teacherrecords
 
@@ -1691,7 +1698,9 @@ jobs:
           import androidx.compose.material3.MaterialTheme
           import androidx.compose.runtime.*
 
-          enum class Screen { DASHBOARD, ADD_TEACHER, ENROL, ATTENDANCE, PRINT, DELETE_TEACHER, DELETE_ATTENDANCE, REPORT }
+          enum class Screen {
+              DASHBOARD, ADD_TEACHER, ENROL, ATTENDANCE, PRINT, DELETE_TEACHER, DELETE_ATTENDANCE, REPORT
+          }
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -1725,11 +1734,11 @@ jobs:
 
       - name: Generate Wrapper 8.6
         run: |
-          gradle wrapper --gradle-version 8.6 --distribution-type bin
+          gradle wrapper --gradle-version 8.6
           chmod +x gradlew
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace --no-daemon
+        run: ./gradlew assembleDebug --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
