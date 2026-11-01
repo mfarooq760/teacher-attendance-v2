@@ -666,8 +666,8 @@ jobs:
               label: String,
               options: List<String>,
               selectedIndex: Int,
-              onSelect: (Int) -> Unit,
-              modifier: Modifier = Modifier.fillMaxWidth()
+              modifier: Modifier = Modifier.fillMaxWidth(),
+              onSelect: (Int) -> Unit
           ) {
               var expanded by remember { mutableStateOf(false) }
               ExposedDropdownMenuBox(
