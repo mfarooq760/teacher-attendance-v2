@@ -89,8 +89,8 @@ jobs:
                   applicationId "com.school.teacherrecords"
                   minSdk 26
                   targetSdk 34
-                  versionCode 3
-                  versionName "3.0"
+                  versionCode 4
+                  versionName "3.1"
               }
 
               compileOptions {
@@ -264,7 +264,7 @@ jobs:
                   return c
               }
 
-                            // Returns null when the backend is ready, otherwise the full error chain.
+              // Returns null when the backend is ready, otherwise the full error chain.
               fun checkConnection(): String? = try {
                   conn()
                   null
@@ -277,7 +277,6 @@ jobs:
                   }
                   parts.joinToString("\nCaused by: ")
               }
-              
 
               // The app does not create its backend. It only checks that the tables exist.
               private fun verifySchema(c: Connection) {
@@ -1956,7 +1955,9 @@ jobs:
               ) {
                   Text("Backend not found", style = MaterialTheme.typography.headlineSmall)
                   Text("This app needs its own PostgreSQL backend on this phone. It does not exist yet or the server is not running.")
-                  Text(error, color = MaterialTheme.colorScheme.error)
+                  SelectionContainer {
+                      Text(error, color = MaterialTheme.colorScheme.error, style = mono)
+                  }
 
                   Text("How to create it", style = MaterialTheme.typography.titleMedium)
                   Text("1. In PG Setup Console, tap 1 Install server and Run (only once per phone).")
