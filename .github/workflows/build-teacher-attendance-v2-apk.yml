@@ -1821,7 +1821,6 @@ jobs:
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/BackendSetup.kt
           package com.school.teacherrecords
 
-          import android.content.Intent
           import android.widget.Toast
           import androidx.compose.foundation.layout.Arrangement
           import androidx.compose.foundation.layout.Column
@@ -1934,7 +1933,43 @@ jobs:
               }
           }
 
-          @                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+          @Composable
+          fun BackendSetupScreen(error: String, onRetry: () -> Unit) {
+              val context = LocalContext.current
+              val clipboard = LocalClipboardManager.current
+              val script = remember { BackendSpec.script() }
+              val mono = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(10.dp)
+              ) {
+                  Text("Backend not found", style = MaterialTheme.typography.headlineSmall)
+                  Text("This app needs its own PostgreSQL backend on this phone. It does not exist yet or the server is not running.")
+                  Text(error, color = MaterialTheme.colorScheme.error)
+
+                  Text("How to create it", style = MaterialTheme.typography.titleMedium)
+                  Text("1. In PG Setup Console, tap 1 Install server and Run (only once per phone).")
+                  Text("2. Tap Copy script below, open PG Setup Console, tap Paste from clipboard, then Run in Termux.")
+                  Text("3. Come back here and tap Retry.")
+
+                  Text("Backend specification", style = MaterialTheme.typography.titleMedium)
+                  SelectionContainer { Text(BackendSpec.summary(), style = mono) }
+
+                  Text("Backend creation script", style = MaterialTheme.typography.titleMedium)
+                  OutlinedTextField(
+                      value = script,
+                      onValueChange = {},
+                      readOnly = true,
+                      textStyle = mono,
+                      minLines = 8,
+                      modifier = Modifier.fillMaxWidth()
+                  )
+
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       Button(
                           onClick = {
                               clipboard.setText(AnnotatedString(script))
