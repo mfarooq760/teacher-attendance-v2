@@ -264,20 +264,20 @@ jobs:
                   return c
               }
 
-              // Returns null when the backend is ready, otherwise a readable error message.
+                            // Returns null when the backend is ready, otherwise the full error chain.
+              fun checkConnection(): String? = try {
+                  conn()
+                  null
+              } catch (e: Throwable) {
+                  val parts = mutableListOf<String>()
+                  var t: Throwable? = e
+                  while (t != null && parts.size < 5) {
+                      parts.add(t.javaClass.name + ": " + (t.message ?: ""))
+                      t = t.cause
+                  }
+                  parts.joinToString("\nCaused by: ")
+              }
               
-             fun checkConnection(): String? = try {
-            conn()
-               null
-                } catch (e: Throwable) {
-                    val parts = mutableListOf<String>()
-               var t: Throwable? = e
-           while (t != null && parts.size < 5) {
-        parts.add(t.javaClass.name + ": " + (t.message ?: ""))
-        t = t.cause
-    }
-               parts.joinToString("\nCaused by: ")
-             } 
 
               // The app does not create its backend. It only checks that the tables exist.
               private fun verifySchema(c: Connection) {
