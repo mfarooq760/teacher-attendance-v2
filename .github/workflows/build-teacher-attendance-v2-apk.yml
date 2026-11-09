@@ -1934,41 +1934,102 @@ jobs:
               }
           }
 
+          @                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(
+                          onClick = {
+                              clipboard.setText(AnnotatedString(script))
+                              Toast.makeText(context, "Script copied", Toast.LENGTH_SHORT).show()
+                          },
+                          modifier = Modifier.weight(1f)
+                      ) { Text("Copy script") }
+                      OutlinedButton(onClick = onRetry, modifier = Modifier.weight(1f)) { Text("Retry") }
+                  }
+              }
+          }
+          EOF
+
+          # 10. MainActivity.kt
+          cat << 'EOF' > app/src/main/java/com/school/teacherrecords/MainActivity.kt
+          package com.school.teacherrecords
+
+          import android.os.Bundle
+          import android.os.StrictMode
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Surface
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+
+          enum class Screen {
+              DASHBOARD, ADD_TEACHER, ENROL, PROMOTE, ATTENDANCE, PRINT, REPORT, DELETE_TEACHER, DELETE_ATTENDANCE
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  // The screens call the database directly, so allow network use on the main thread
+                  StrictMode.setThreadPolicy(StrictMode.ThreadPolicy.Builder().permitAll().build())
+                  val db = DatabaseHelper(applicationContext)
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize()) { AppRoot(db) }
+                      }
+                  }
+              }
+          }
+
           @Composable
-          fun BackendSetupScreen(error: String, onRetry: () -> Unit) {
-              val context = LocalContext.current
-              val clipboard = LocalClipboardManager.current
-              val script = remember { BackendSpec.script() }
-              val mono = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+          fun AppRoot(db: DatabaseHelper) {
+              var attempt by remember { mutableIntStateOf(0) }
+              var ready by remember { mutableStateOf(false) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var screen by remember { mutableStateOf(Screen.DASHBOARD) }
 
-              Column(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .verticalScroll(rememberScrollState())
-                      .padding(16.dp),
-                  verticalArrangement = Arrangement.spacedBy(10.dp)
-              ) {
-                  Text("Backend not found", style = MaterialTheme.typography.headlineSmall)
-                  Text("This app needs its own PostgreSQL backend on this phone. It does not exist yet or the server is not running.")
-                  Text(error, color = MaterialTheme.colorScheme.error)
+              LaunchedEffect(attempt) {
+                  ready = false
+                  error = withContext(Dispatchers.IO) { db.checkConnection() }
+                  ready = true
+              }
 
-                  Text("How to create it", style = MaterialTheme.typography.titleMedium)
-                  Text("1. In PG Setup Console, tap 1 Install server and Run (only once per phone).")
-                  Text("2. Tap Copy script below, open PG Setup Console, tap Paste from clipboard, then Run in Termux.")
-                  Text("3. Come back here and tap Retry.")
+              BackHandler(enabled = screen != Screen.DASHBOARD) { screen = Screen.DASHBOARD }
 
-                  Text("Backend specification", style = MaterialTheme.typography.titleMedium)
-                  SelectionContainer { Text(BackendSpec.summary(), style = mono) }
+              val err = error
+              if (!ready) {
+                  Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                      CircularProgressIndicator()
+                  }
+              } else if (err != null) {
+                  BackendSetupScreen(err) { attempt++ }
+              } else {
+                  val back = { screen = Screen.DASHBOARD }
+                  when (screen) {
+                      Screen.DASHBOARD -> DashboardScreen(db) { screen = it }
+                      Screen.ADD_TEACHER -> AddTeacherScreen(db, back)
+                      Screen.ENROL -> EnrolScreen(db, back)
+                      Screen.PROMOTE -> PromoteScreen(db, back)
+                      Screen.ATTENDANCE -> TakeAttendanceScreen(db, back)
+                      Screen.PRINT -> PrintAttendanceScreen(db, back)
+                      Screen.REPORT -> ReportScreen(db, back)
+                      Screen.DELETE_TEACHER -> DeleteTeacherScreen(db, back)
+                      Screen.DELETE_ATTENDANCE -> DeleteAttendanceScreen(db, back)
+                  }
+              }
+          }
+          EOF
 
-                  Text("Backend creation script", style = MaterialTheme.typography.titleMedium)
-                  OutlinedTextField(
-                      value = script,
-                      onValueChange = {},
-                      readOnly = true,
-                      textStyle = mono,
-                      minLines = 8,
-                      modifier = Modifier.fillMaxWidth()
-                  )
+      - name: Build Debug APK
+        run: gradle assembleDebug --stacktrace
 
-                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-     
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TeacherAttendance-APK
+          path: app/build/outputs/apk/debug/*.apk
