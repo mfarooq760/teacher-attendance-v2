@@ -87,10 +87,10 @@ jobs:
 
               defaultConfig {
                   applicationId "com.school.teacherrecords"
-                  minSdk 24
+                  minSdk 26
                   targetSdk 34
-                  versionCode 2
-                  versionName "2.1"
+                  versionCode 3
+                  versionName "3.0"
               }
 
               compileOptions {
@@ -109,6 +109,12 @@ jobs:
               composeOptions {
                   kotlinCompilerExtensionVersion '1.5.8'
               }
+
+              packaging {
+                  resources {
+                      excludes += ['/META-INF/versions/**', '/META-INF/DEPENDENCIES', '/META-INF/LICENSE*', '/META-INF/NOTICE*']
+                  }
+              }
           }
 
           dependencies {
@@ -119,6 +125,8 @@ jobs:
               implementation 'androidx.compose.ui:ui'
               implementation 'androidx.compose.material3:material3'
               implementation 'com.google.code.gson:gson:2.10.1'
+              implementation 'org.postgresql:postgresql:42.7.3'
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
           }
           EOF
 
@@ -126,6 +134,7 @@ jobs:
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
               <application
                   android:allowBackup="true"
                   android:icon="@android:drawable/sym_def_app_icon"
@@ -163,15 +172,15 @@ jobs:
           </paths>
           EOF
 
-          # 6. DatabaseHelper.kt (three related tables)
+          # 6. DatabaseHelper.kt (PostgreSQL backend, three related tables)
           cat << 'EOF' > app/src/main/java/com/school/teacherrecords/DatabaseHelper.kt
           package com.school.teacherrecords
 
-          import android.content.ContentValues
           import android.content.Context
-          import android.database.DatabaseUtils
-          import android.database.sqlite.SQLiteDatabase
-          import android.database.sqlite.SQLiteOpenHelper
+          import java.sql.Connection
+          import java.sql.DriverManager
+          import java.sql.ResultSet
+          import java.util.Properties
 
           // ---------- Row models ----------
           data class Teacher(
@@ -208,230 +217,231 @@ jobs:
               val attendance: List<AttendanceRow>?
           )
 
-          class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, "TeacherRecords.db", null, 2) {
+          // ---------- PostgreSQL connection settings (database, user and password come from BackendSpec) ----------
+          object PgConfig {
+              const val HOST = "127.0.0.1"
+              const val PORT = 5432
+              const val DATABASE = BackendSpec.DATABASE
+              const val USER = BackendSpec.USER
+              const val PASSWORD = BackendSpec.PASSWORD
+          }
 
-              override fun onConfigure(db: SQLiteDatabase) {
-                  super.onConfigure(db)
-                  db.setForeignKeyConstraintsEnabled(true)
+          class DatabaseHelper(context: Context) {
+
+              private var connection: Connection? = null
+
+              @Synchronized
+              private fun conn(): Connection {
+                  val existing = connection
+                  if (existing != null && runCatching { !existing.isClosed && existing.isValid(2) }.getOrDefault(false)) {
+                      return existing
+                  }
+                  runCatching { existing?.close() }
+                  Class.forName("org.postgresql.Driver")
+                  val props = Properties().apply {
+                      setProperty("user", PgConfig.USER)
+                      setProperty("password", PgConfig.PASSWORD)
+                      setProperty("ssl", "false")
+                      setProperty("sslmode", "disable")
+                      setProperty("gssEncMode", "disable")
+                      setProperty("connectTimeout", "3")
+                      setProperty("loginTimeout", "5")
+                      setProperty("socketTimeout", "20")
+                      setProperty("tcpKeepAlive", "true")
+                      setProperty("ApplicationName", "TeacherAttendance")
+                  }
+                  val c = DriverManager.getConnection(
+                      "jdbc:postgresql://" + PgConfig.HOST + ":" + PgConfig.PORT + "/" + PgConfig.DATABASE, props
+                  )
+                  c.autoCommit = true
+                  try {
+                      verifySchema(c)
+                  } catch (e: Exception) {
+                      runCatching { c.close() }
+                      throw e
+                  }
+                  connection = c
+                  return c
               }
 
-              override fun onCreate(db: SQLiteDatabase) {
-                  // Table 1: basic information
-                  db.execSQL("""
-                      CREATE TABLE tblTeachers (
-                          RecordID INTEGER PRIMARY KEY AUTOINCREMENT,
-                          TeacherName TEXT NOT NULL,
-                          FatherHusbandName TEXT NOT NULL,
-                          AppointmentSession TEXT NOT NULL
-                      )
-                  """.trimIndent())
-
-                  // Table 2: attendance enrolment. One row per teacher + session + month (unique together)
-                  db.execSQL("""
-                      CREATE TABLE tblAttendanceEnrollment (
-                          EnrollmentID INTEGER PRIMARY KEY AUTOINCREMENT,
-                          EnrollmentRecordIDFK INTEGER NOT NULL REFERENCES tblTeachers(RecordID) ON DELETE CASCADE,
-                          AttendanceEnrollmentSession TEXT NOT NULL,
-                          AttendanceEnrollmentMonth INTEGER NOT NULL,
-                          UNIQUE (EnrollmentRecordIDFK, AttendanceEnrollmentSession, AttendanceEnrollmentMonth)
-                      )
-                  """.trimIndent())
-
-                  // Table 3: only absent / late / half day / leave. Full date (yyyy-MM-dd), unique per enrolment + date
-                  db.execSQL("""
-                      CREATE TABLE tblAttendanceRecords (
-                          AttendanceID INTEGER PRIMARY KEY AUTOINCREMENT,
-                          AttendanceRecordIDFK INTEGER NOT NULL REFERENCES tblTeachers(RecordID) ON DELETE CASCADE,
-                          AttendanceEnrollmentIDFK INTEGER NOT NULL REFERENCES tblAttendanceEnrollment(EnrollmentID) ON DELETE CASCADE,
-                          AttendanceDate TEXT NOT NULL,
-                          AttendanceStatus TEXT NOT NULL,
-                          UNIQUE (AttendanceEnrollmentIDFK, AttendanceDate)
-                      )
-                  """.trimIndent())
+              // Returns null when the backend is ready, otherwise a readable error message.
+              fun checkConnection(): String? = try {
+                  conn()
+                  null
+              } catch (e: Throwable) {
+                  e.message ?: e.javaClass.simpleName
               }
 
-              override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-                  // Version 1 had a day number instead of a full date: rebuild the tables
-                  db.execSQL("DROP TABLE IF EXISTS tblAttendanceRecords")
-                  db.execSQL("DROP TABLE IF EXISTS tblAttendanceEnrollment")
-                  db.execSQL("DROP TABLE IF EXISTS tblTeachers")
-                  onCreate(db)
+              // The app does not create its backend. It only checks that the tables exist.
+              private fun verifySchema(c: Connection) {
+                  val missing = BackendSpec.tableNames.filter { t ->
+                      !c.rows("SELECT to_regclass(CAST(? AS text)) IS NOT NULL", t) { it.getBoolean(1) }.first()
+                  }
+                  if (missing.isNotEmpty()) {
+                      throw IllegalStateException("Backend tables missing: " + missing.joinToString(", "))
+                  }
               }
+
+              // ---------- small JDBC helpers ----------
+              private fun Connection.exec(sql: String, vararg args: Any?): Int =
+                  prepareStatement(sql).use { ps ->
+                      args.forEachIndexed { i, a -> ps.setObject(i + 1, a) }
+                      ps.executeUpdate()
+                  }
+
+              private fun <T> Connection.rows(sql: String, vararg args: Any?, map: (ResultSet) -> T): List<T> {
+                  val out = mutableListOf<T>()
+                  prepareStatement(sql).use { ps ->
+                      args.forEachIndexed { i, a -> ps.setObject(i + 1, a) }
+                      ps.executeQuery().use { rs -> while (rs.next()) out.add(map(rs)) }
+                  }
+                  return out
+              }
+
+              private fun <T> transaction(block: (Connection) -> T): T {
+                  val c = conn()
+                  c.autoCommit = false
+                  try {
+                      val result = block(c)
+                      c.commit()
+                      return result
+                  } catch (e: Exception) {
+                      runCatching { c.rollback() }
+                      throw e
+                  } finally {
+                      c.autoCommit = true
+                  }
+              }
+
+              private fun teacher(rs: ResultSet) =
+                  Teacher(rs.getLong(1), rs.getString(2), rs.getString(3), rs.getString(4))
 
               // ---------- Counts ----------
               fun getCounts(): Triple<Int, Int, Int> {
-                  val db = readableDatabase
-                  return Triple(
-                      DatabaseUtils.queryNumEntries(db, "tblTeachers").toInt(),
-                      DatabaseUtils.queryNumEntries(db, "tblAttendanceEnrollment").toInt(),
-                      DatabaseUtils.queryNumEntries(db, "tblAttendanceRecords").toInt()
-                  )
+                  val c = conn()
+                  fun count(table: String): Int = c.rows("SELECT COUNT(*) FROM " + table) { it.getInt(1) }.first()
+                  return Triple(count("tblTeachers"), count("tblAttendanceEnrollment"), count("tblAttendanceRecords"))
               }
 
               // ---------- Table 1: teachers ----------
               fun getTeachers(sessionPrefix: String): List<Teacher> {
-                  val list = mutableListOf<Teacher>()
-                  val sql = "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers" +
-                      (if (sessionPrefix.isBlank()) "" else " WHERE AppointmentSession LIKE ?") +
-                      " ORDER BY TeacherName COLLATE NOCASE"
-                  val args = if (sessionPrefix.isBlank()) null else arrayOf("$sessionPrefix%")
-                  readableDatabase.rawQuery(sql, args).use { c ->
-                      while (c.moveToNext()) {
-                          list.add(Teacher(c.getLong(0), c.getString(1), c.getString(2), c.getString(3)))
-                      }
+                  val select = "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers"
+                  val order = " ORDER BY LOWER(TeacherName)"
+                  return if (sessionPrefix.isBlank()) {
+                      conn().rows(select + order) { teacher(it) }
+                  } else {
+                      conn().rows(select + " WHERE AppointmentSession LIKE ?" + order, sessionPrefix + "%") { teacher(it) }
                   }
-                  return list
               }
 
               // Teachers appointed in or before the given session
-              fun getEligibleTeachers(session: String): List<Teacher> {
-                  val list = mutableListOf<Teacher>()
-                  val sql = "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers " +
-                      "WHERE AppointmentSession <= ? ORDER BY TeacherName COLLATE NOCASE"
-                  readableDatabase.rawQuery(sql, arrayOf(session)).use { c ->
-                      while (c.moveToNext()) {
-                          list.add(Teacher(c.getLong(0), c.getString(1), c.getString(2), c.getString(3)))
-                      }
-                  }
-                  return list
-              }
+              fun getEligibleTeachers(session: String): List<Teacher> =
+                  conn().rows(
+                      "SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers " +
+                          "WHERE AppointmentSession COLLATE \"C\" <= ? ORDER BY LOWER(TeacherName)",
+                      session
+                  ) { teacher(it) }
 
-              fun insertTeacher(name: String, fatherName: String, session: String): Long {
-                  val v = ContentValues().apply {
-                      put("TeacherName", name)
-                      put("FatherHusbandName", fatherName)
-                      put("AppointmentSession", session)
-                  }
-                  return writableDatabase.insert("tblTeachers", null, v)
-              }
+              fun insertTeacher(name: String, fatherName: String, session: String): Long =
+                  conn().rows(
+                      "INSERT INTO tblTeachers (TeacherName, FatherHusbandName, AppointmentSession) " +
+                          "VALUES (?, ?, ?) RETURNING RecordID",
+                      name, fatherName, session
+                  ) { it.getLong(1) }.first()
 
               fun updateTeacher(recordId: Long, name: String, fatherName: String, session: String) {
-                  val v = ContentValues().apply {
-                      put("TeacherName", name)
-                      put("FatherHusbandName", fatherName)
-                      put("AppointmentSession", session)
-                  }
-                  writableDatabase.update("tblTeachers", v, "RecordID = ?", arrayOf(recordId.toString()))
+                  conn().exec(
+                      "UPDATE tblTeachers SET TeacherName = ?, FatherHusbandName = ?, AppointmentSession = ? WHERE RecordID = ?",
+                      name, fatherName, session, recordId
+                  )
               }
 
               // Deletes the teacher AND all dependent rows in table 2 and table 3
               fun deleteTeacher(recordId: Long) {
-                  val db = writableDatabase
-                  val id = arrayOf(recordId.toString())
-                  db.beginTransaction()
-                  try {
-                      db.delete("tblAttendanceRecords", "AttendanceRecordIDFK = ?", id)
-                      db.delete("tblAttendanceEnrollment", "EnrollmentRecordIDFK = ?", id)
-                      db.delete("tblTeachers", "RecordID = ?", id)
-                      db.setTransactionSuccessful()
-                  } finally {
-                      db.endTransaction()
+                  transaction { c ->
+                      c.exec("DELETE FROM tblAttendanceRecords WHERE AttendanceRecordIDFK = ?", recordId)
+                      c.exec("DELETE FROM tblAttendanceEnrollment WHERE EnrollmentRecordIDFK = ?", recordId)
+                      c.exec("DELETE FROM tblTeachers WHERE RecordID = ?", recordId)
                   }
               }
 
               // ---------- Table 2: enrolment ----------
-              fun enrol(recordIds: List<Long>, session: String, months: List<Int>): Int {
-                  var added = 0
-                  val db = writableDatabase
-                  db.beginTransaction()
-                  try {
+              fun enrol(recordIds: List<Long>, session: String, months: List<Int>): Int =
+                  transaction { c ->
+                      var added = 0
                       for (id in recordIds) {
                           for (m in months) {
-                              val v = ContentValues().apply {
-                                  put("EnrollmentRecordIDFK", id)
-                                  put("AttendanceEnrollmentSession", session)
-                                  put("AttendanceEnrollmentMonth", m)
-                              }
-                              val rowId = db.insertWithOnConflict(
-                                  "tblAttendanceEnrollment", null, v, SQLiteDatabase.CONFLICT_IGNORE
+                              added += c.exec(
+                                  "INSERT INTO tblAttendanceEnrollment " +
+                                      "(EnrollmentRecordIDFK, AttendanceEnrollmentSession, AttendanceEnrollmentMonth) " +
+                                      "VALUES (?, ?, ?) " +
+                                      "ON CONFLICT (EnrollmentRecordIDFK, AttendanceEnrollmentSession, AttendanceEnrollmentMonth) DO NOTHING",
+                                  id, session, m
                               )
-                              if (rowId != -1L) added++
                           }
                       }
-                      db.setTransactionSuccessful()
-                  } finally {
-                      db.endTransaction()
+                      added
                   }
-                  return added
-              }
 
-              fun getEnrolledIds(session: String, month: Int): Set<Long> {
-                  val set = mutableSetOf<Long>()
-                  val sql = "SELECT EnrollmentRecordIDFK FROM tblAttendanceEnrollment " +
-                      "WHERE AttendanceEnrollmentSession = ? AND AttendanceEnrollmentMonth = ?"
-                  readableDatabase.rawQuery(sql, arrayOf(session, month.toString())).use { c ->
-                      while (c.moveToNext()) set.add(c.getLong(0))
-                  }
-                  return set
-              }
+              fun getEnrolledIds(session: String, month: Int): Set<Long> =
+                  conn().rows(
+                      "SELECT EnrollmentRecordIDFK FROM tblAttendanceEnrollment " +
+                          "WHERE AttendanceEnrollmentSession = ? AND AttendanceEnrollmentMonth = ?",
+                      session, month
+                  ) { it.getLong(1) }.toSet()
 
-              fun getEnrolledTeachers(session: String, month: Int): List<EnrolledTeacher> {
-                  val list = mutableListOf<EnrolledTeacher>()
-                  val sql = "SELECT e.EnrollmentID, t.RecordID, t.TeacherName, t.FatherHusbandName " +
-                      "FROM tblAttendanceEnrollment e JOIN tblTeachers t ON t.RecordID = e.EnrollmentRecordIDFK " +
-                      "WHERE e.AttendanceEnrollmentSession = ? AND e.AttendanceEnrollmentMonth = ? " +
-                      "ORDER BY t.TeacherName COLLATE NOCASE"
-                  readableDatabase.rawQuery(sql, arrayOf(session, month.toString())).use { c ->
-                      while (c.moveToNext()) {
-                          list.add(EnrolledTeacher(c.getLong(0), c.getLong(1), c.getString(2), c.getString(3)))
-                      }
-                  }
-                  return list
-              }
+              fun getEnrolledTeachers(session: String, month: Int): List<EnrolledTeacher> =
+                  conn().rows(
+                      "SELECT e.EnrollmentID, t.RecordID, t.TeacherName, t.FatherHusbandName " +
+                          "FROM tblAttendanceEnrollment e JOIN tblTeachers t ON t.RecordID = e.EnrollmentRecordIDFK " +
+                          "WHERE e.AttendanceEnrollmentSession = ? AND e.AttendanceEnrollmentMonth = ? " +
+                          "ORDER BY LOWER(t.TeacherName)",
+                      session, month
+                  ) { EnrolledTeacher(it.getLong(1), it.getLong(2), it.getString(3), it.getString(4)) }
 
               // Teachers enrolled in at least one month of the session
-              fun getTeachersEnrolledInSession(session: String): List<Teacher> {
-                  val list = mutableListOf<Teacher>()
-                  val sql = "SELECT DISTINCT t.RecordID, t.TeacherName, t.FatherHusbandName, t.AppointmentSession " +
-                      "FROM tblAttendanceEnrollment e JOIN tblTeachers t ON t.RecordID = e.EnrollmentRecordIDFK " +
-                      "WHERE e.AttendanceEnrollmentSession = ? ORDER BY t.TeacherName COLLATE NOCASE"
-                  readableDatabase.rawQuery(sql, arrayOf(session)).use { c ->
-                      while (c.moveToNext()) {
-                          list.add(Teacher(c.getLong(0), c.getString(1), c.getString(2), c.getString(3)))
-                      }
-                  }
-                  return list
-              }
+              fun getTeachersEnrolledInSession(session: String): List<Teacher> =
+                  conn().rows(
+                      "SELECT t.RecordID, t.TeacherName, t.FatherHusbandName, t.AppointmentSession " +
+                          "FROM tblAttendanceEnrollment e JOIN tblTeachers t ON t.RecordID = e.EnrollmentRecordIDFK " +
+                          "WHERE e.AttendanceEnrollmentSession = ? " +
+                          "GROUP BY t.RecordID, t.TeacherName, t.FatherHusbandName, t.AppointmentSession " +
+                          "ORDER BY LOWER(t.TeacherName)",
+                      session
+                  ) { teacher(it) }
 
               // ---------- Table 3: attendance records ----------
               // Returns enrollmentId -> status for one full date (yyyy-MM-dd)
-              fun getAttendanceForDate(session: String, date: String): Map<Long, String> {
-                  val map = mutableMapOf<Long, String>()
-                  val sql = "SELECT r.AttendanceEnrollmentIDFK, r.AttendanceStatus " +
-                      "FROM tblAttendanceRecords r JOIN tblAttendanceEnrollment e ON e.EnrollmentID = r.AttendanceEnrollmentIDFK " +
-                      "WHERE e.AttendanceEnrollmentSession = ? AND r.AttendanceDate = ?"
-                  readableDatabase.rawQuery(sql, arrayOf(session, date)).use { c ->
-                      while (c.moveToNext()) map[c.getLong(0)] = c.getString(1)
-                  }
-                  return map
-              }
+              fun getAttendanceForDate(session: String, date: String): Map<Long, String> =
+                  conn().rows(
+                      "SELECT r.AttendanceEnrollmentIDFK, r.AttendanceStatus " +
+                          "FROM tblAttendanceRecords r JOIN tblAttendanceEnrollment e ON e.EnrollmentID = r.AttendanceEnrollmentIDFK " +
+                          "WHERE e.AttendanceEnrollmentSession = ? AND r.AttendanceDate = ?",
+                      session, date
+                  ) { Pair(it.getLong(1), it.getString(2)) }.toMap()
 
               // "P" (present) removes any record for that date; other statuses are stored
               fun saveAttendanceDate(date: String, enrolled: List<EnrolledTeacher>, statuses: Map<Long, String>) {
-                  val db = writableDatabase
-                  db.beginTransaction()
-                  try {
+                  transaction { c ->
                       for (t in enrolled) {
                           val st = statuses[t.enrollmentId] ?: "P"
                           if (st == "P") {
-                              db.delete(
-                                  "tblAttendanceRecords",
-                                  "AttendanceEnrollmentIDFK = ? AND AttendanceDate = ?",
-                                  arrayOf(t.enrollmentId.toString(), date)
+                              c.exec(
+                                  "DELETE FROM tblAttendanceRecords WHERE AttendanceEnrollmentIDFK = ? AND AttendanceDate = ?",
+                                  t.enrollmentId, date
                               )
                           } else {
-                              val v = ContentValues().apply {
-                                  put("AttendanceRecordIDFK", t.recordId)
-                                  put("AttendanceEnrollmentIDFK", t.enrollmentId)
-                                  put("AttendanceDate", date)
-                                  put("AttendanceStatus", st)
-                              }
-                              db.insertWithOnConflict("tblAttendanceRecords", null, v, SQLiteDatabase.CONFLICT_REPLACE)
+                              c.exec(
+                                  "INSERT INTO tblAttendanceRecords " +
+                                      "(AttendanceRecordIDFK, AttendanceEnrollmentIDFK, AttendanceDate, AttendanceStatus) " +
+                                      "VALUES (?, ?, ?, ?) " +
+                                      "ON CONFLICT (AttendanceEnrollmentIDFK, AttendanceDate) DO UPDATE SET " +
+                                      "AttendanceStatus = EXCLUDED.AttendanceStatus, " +
+                                      "AttendanceRecordIDFK = EXCLUDED.AttendanceRecordIDFK",
+                                  t.recordId, t.enrollmentId, date, st
+                              )
                           }
                       }
-                      db.setTransactionSuccessful()
-                  } finally {
-                      db.endTransaction()
                   }
               }
 
@@ -439,117 +449,94 @@ jobs:
               fun deleteAttendanceRecords(recordId: Long, session: String, month: Int?): Int {
                   val sub = "SELECT EnrollmentID FROM tblAttendanceEnrollment WHERE AttendanceEnrollmentSession = ?" +
                       (if (month != null) " AND AttendanceEnrollmentMonth = ?" else "")
-                  val args = mutableListOf(recordId.toString(), session)
-                  if (month != null) args.add(month.toString())
-                  return writableDatabase.delete(
-                      "tblAttendanceRecords",
-                      "AttendanceRecordIDFK = ? AND AttendanceEnrollmentIDFK IN ($sub)",
-                      args.toTypedArray()
+                  val args = mutableListOf<Any?>(recordId, session)
+                  if (month != null) args.add(month)
+                  return conn().exec(
+                      "DELETE FROM tblAttendanceRecords WHERE AttendanceRecordIDFK = ? AND AttendanceEnrollmentIDFK IN (" + sub + ")",
+                      *args.toTypedArray()
                   )
               }
 
               // All records of a session between two full dates (inclusive), used for printing
-              fun getAttendanceBetween(session: String, fromDate: String, toDate: String): List<PrintRow> {
-                  val list = mutableListOf<PrintRow>()
-                  val sql = "SELECT r.AttendanceDate, t.TeacherName, t.FatherHusbandName, r.AttendanceStatus " +
-                      "FROM tblAttendanceRecords r " +
-                      "JOIN tblAttendanceEnrollment e ON e.EnrollmentID = r.AttendanceEnrollmentIDFK " +
-                      "JOIN tblTeachers t ON t.RecordID = r.AttendanceRecordIDFK " +
-                      "WHERE e.AttendanceEnrollmentSession = ? AND r.AttendanceDate BETWEEN ? AND ? " +
-                      "ORDER BY r.AttendanceDate, t.TeacherName COLLATE NOCASE"
-                  readableDatabase.rawQuery(sql, arrayOf(session, fromDate, toDate)).use { c ->
-                      while (c.moveToNext()) {
-                          list.add(PrintRow(c.getString(0), c.getString(1), c.getString(2), c.getString(3)))
-                      }
-                  }
-                  return list
-              }
+              fun getAttendanceBetween(session: String, fromDate: String, toDate: String): List<PrintRow> =
+                  conn().rows(
+                      "SELECT r.AttendanceDate, t.TeacherName, t.FatherHusbandName, r.AttendanceStatus " +
+                          "FROM tblAttendanceRecords r " +
+                          "JOIN tblAttendanceEnrollment e ON e.EnrollmentID = r.AttendanceEnrollmentIDFK " +
+                          "JOIN tblTeachers t ON t.RecordID = r.AttendanceRecordIDFK " +
+                          "WHERE e.AttendanceEnrollmentSession = ? AND r.AttendanceDate BETWEEN ? AND ? " +
+                          "ORDER BY r.AttendanceDate, LOWER(t.TeacherName)",
+                      session, fromDate, toDate
+                  ) { PrintRow(it.getString(1), it.getString(2), it.getString(3), it.getString(4)) }
 
               // ---------- Report ----------
-              fun getMonthlyReport(session: String, month: Int): List<ReportRow> {
-                  val list = mutableListOf<ReportRow>()
-                  val sql = "SELECT t.TeacherName, t.FatherHusbandName, " +
-                      "SUM(CASE WHEN r.AttendanceStatus = 'ABSENT' THEN 1 ELSE 0 END), " +
-                      "SUM(CASE WHEN r.AttendanceStatus = 'LATE' THEN 1 ELSE 0 END), " +
-                      "SUM(CASE WHEN r.AttendanceStatus = 'HALF_DAY' THEN 1 ELSE 0 END), " +
-                      "SUM(CASE WHEN r.AttendanceStatus = 'LEAVE' THEN 1 ELSE 0 END) " +
-                      "FROM tblAttendanceEnrollment e " +
-                      "JOIN tblTeachers t ON t.RecordID = e.EnrollmentRecordIDFK " +
-                      "LEFT JOIN tblAttendanceRecords r ON r.AttendanceEnrollmentIDFK = e.EnrollmentID " +
-                      "WHERE e.AttendanceEnrollmentSession = ? AND e.AttendanceEnrollmentMonth = ? " +
-                      "GROUP BY e.EnrollmentID ORDER BY t.TeacherName COLLATE NOCASE"
-                  readableDatabase.rawQuery(sql, arrayOf(session, month.toString())).use { c ->
-                      while (c.moveToNext()) {
-                          list.add(ReportRow(c.getString(0), c.getString(1), c.getInt(2), c.getInt(3), c.getInt(4), c.getInt(5)))
-                      }
-                  }
-                  return list
-              }
+              fun getMonthlyReport(session: String, month: Int): List<ReportRow> =
+                  conn().rows(
+                      "SELECT t.TeacherName, t.FatherHusbandName, " +
+                          "SUM(CASE WHEN r.AttendanceStatus = 'ABSENT' THEN 1 ELSE 0 END), " +
+                          "SUM(CASE WHEN r.AttendanceStatus = 'LATE' THEN 1 ELSE 0 END), " +
+                          "SUM(CASE WHEN r.AttendanceStatus = 'HALF_DAY' THEN 1 ELSE 0 END), " +
+                          "SUM(CASE WHEN r.AttendanceStatus = 'LEAVE' THEN 1 ELSE 0 END) " +
+                          "FROM tblAttendanceEnrollment e " +
+                          "JOIN tblTeachers t ON t.RecordID = e.EnrollmentRecordIDFK " +
+                          "LEFT JOIN tblAttendanceRecords r ON r.AttendanceEnrollmentIDFK = e.EnrollmentID " +
+                          "WHERE e.AttendanceEnrollmentSession = ? AND e.AttendanceEnrollmentMonth = ? " +
+                          "GROUP BY e.EnrollmentID, t.RecordID, t.TeacherName, t.FatherHusbandName " +
+                          "ORDER BY LOWER(t.TeacherName)",
+                      session, month
+                  ) { ReportRow(it.getString(1), it.getString(2), it.getInt(3), it.getInt(4), it.getInt(5), it.getInt(6)) }
 
-              // ---------- Backup / restore (all three tables) ----------
+              // ---------- Backup / restore (all three tables, same JSON format as the old SQLite version) ----------
               fun getBackup(): BackupData {
-                  val db = readableDatabase
-                  val teachers = mutableListOf<TeacherRow>()
-                  val enrollments = mutableListOf<EnrollmentRow>()
-                  val attendance = mutableListOf<AttendanceRow>()
-                  db.rawQuery("SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers", null).use { c ->
-                      while (c.moveToNext()) teachers.add(TeacherRow(c.getLong(0), c.getString(1), c.getString(2), c.getString(3)))
+                  val c = conn()
+                  val teachers = c.rows("SELECT RecordID, TeacherName, FatherHusbandName, AppointmentSession FROM tblTeachers") {
+                      TeacherRow(it.getLong(1), it.getString(2), it.getString(3), it.getString(4))
                   }
-                  db.rawQuery(
-                      "SELECT EnrollmentID, EnrollmentRecordIDFK, AttendanceEnrollmentSession, AttendanceEnrollmentMonth FROM tblAttendanceEnrollment",
-                      null
-                  ).use { c ->
-                      while (c.moveToNext()) enrollments.add(EnrollmentRow(c.getLong(0), c.getLong(1), c.getString(2), c.getInt(3)))
-                  }
-                  db.rawQuery(
-                      "SELECT AttendanceID, AttendanceRecordIDFK, AttendanceEnrollmentIDFK, AttendanceDate, AttendanceStatus FROM tblAttendanceRecords",
-                      null
-                  ).use { c ->
-                      while (c.moveToNext()) attendance.add(AttendanceRow(c.getLong(0), c.getLong(1), c.getLong(2), c.getString(3), c.getString(4)))
-                  }
+                  val enrollments = c.rows(
+                      "SELECT EnrollmentID, EnrollmentRecordIDFK, AttendanceEnrollmentSession, AttendanceEnrollmentMonth FROM tblAttendanceEnrollment"
+                  ) { EnrollmentRow(it.getLong(1), it.getLong(2), it.getString(3), it.getInt(4)) }
+                  val attendance = c.rows(
+                      "SELECT AttendanceID, AttendanceRecordIDFK, AttendanceEnrollmentIDFK, AttendanceDate, AttendanceStatus FROM tblAttendanceRecords"
+                  ) { AttendanceRow(it.getLong(1), it.getLong(2), it.getLong(3), it.getString(4), it.getString(5)) }
                   return BackupData(3, teachers, enrollments, attendance)
               }
 
               // Replaces ALL current data with the backup
               fun restoreBackup(data: BackupData) {
-                  val db = writableDatabase
-                  db.beginTransaction()
-                  try {
-                      db.delete("tblAttendanceRecords", null, null)
-                      db.delete("tblAttendanceEnrollment", null, null)
-                      db.delete("tblTeachers", null, null)
+                  transaction { c ->
+                      c.exec("DELETE FROM tblAttendanceRecords")
+                      c.exec("DELETE FROM tblAttendanceEnrollment")
+                      c.exec("DELETE FROM tblTeachers")
                       for (t in data.teachers.orEmpty()) {
-                          val v = ContentValues().apply {
-                              put("RecordID", t.recordId)
-                              put("TeacherName", t.name)
-                              put("FatherHusbandName", t.fatherName)
-                              put("AppointmentSession", t.appointmentSession)
-                          }
-                          db.insertOrThrow("tblTeachers", null, v)
+                          c.exec(
+                              "INSERT INTO tblTeachers (RecordID, TeacherName, FatherHusbandName, AppointmentSession) VALUES (?, ?, ?, ?)",
+                              t.recordId, t.name, t.fatherName, t.appointmentSession
+                          )
                       }
                       for (e in data.enrollments.orEmpty()) {
-                          val v = ContentValues().apply {
-                              put("EnrollmentID", e.enrollmentId)
-                              put("EnrollmentRecordIDFK", e.teacherId)
-                              put("AttendanceEnrollmentSession", e.session)
-                              put("AttendanceEnrollmentMonth", e.month)
-                          }
-                          db.insertOrThrow("tblAttendanceEnrollment", null, v)
+                          c.exec(
+                              "INSERT INTO tblAttendanceEnrollment (EnrollmentID, EnrollmentRecordIDFK, AttendanceEnrollmentSession, AttendanceEnrollmentMonth) VALUES (?, ?, ?, ?)",
+                              e.enrollmentId, e.teacherId, e.session, e.month
+                          )
                       }
                       for (a in data.attendance.orEmpty()) {
-                          val v = ContentValues().apply {
-                              put("AttendanceID", a.attendanceId)
-                              put("AttendanceRecordIDFK", a.teacherId)
-                              put("AttendanceEnrollmentIDFK", a.enrollmentId)
-                              put("AttendanceDate", a.date)
-                              put("AttendanceStatus", a.status)
-                          }
-                          db.insertOrThrow("tblAttendanceRecords", null, v)
+                          c.exec(
+                              "INSERT INTO tblAttendanceRecords (AttendanceID, AttendanceRecordIDFK, AttendanceEnrollmentIDFK, AttendanceDate, AttendanceStatus) VALUES (?, ?, ?, ?, ?)",
+                              a.attendanceId, a.teacherId, a.enrollmentId, a.date, a.status
+                          )
                       }
-                      db.setTransactionSuccessful()
-                  } finally {
-                      db.endTransaction()
+                      resetSequence(c, "tblTeachers", "recordid", "RecordID")
+                      resetSequence(c, "tblAttendanceEnrollment", "enrollmentid", "EnrollmentID")
+                      resetSequence(c, "tblAttendanceRecords", "attendanceid", "AttendanceID")
                   }
+              }
+
+              // After restoring explicit IDs, the next automatic ID must continue after the highest one
+              private fun resetSequence(c: Connection, table: String, seqColumn: String, column: String) {
+                  c.rows(
+                      "SELECT setval(pg_get_serial_sequence('" + table + "', '" + seqColumn + "'), " +
+                          "COALESCE((SELECT MAX(" + column + ") FROM " + table + "), 0) + 1, false)"
+                  ) { it.getLong(1) }
               }
           }
           EOF
@@ -1830,62 +1817,158 @@ jobs:
           }
           EOF
 
-          # 10. MainActivity.kt (navigation)
-          cat << 'EOF' > app/src/main/java/com/school/teacherrecords/MainActivity.kt
+          # 9b. BackendSetup.kt (backend specification, script generator and the "Backend not found" form)
+          cat << 'EOF' > app/src/main/java/com/school/teacherrecords/BackendSetup.kt
           package com.school.teacherrecords
 
-          import android.os.Bundle
-          import androidx.activity.ComponentActivity
-          import androidx.activity.compose.BackHandler
-          import androidx.activity.compose.setContent
+          import android.content.Intent
+          import android.widget.Toast
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.Button
           import androidx.compose.material3.MaterialTheme
-          import androidx.compose.runtime.*
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.remember
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
 
-          enum class Screen {
-              DASHBOARD, ADD_TEACHER, ENROL, PROMOTE, ATTENDANCE, PRINT, DELETE_TEACHER, DELETE_ATTENDANCE, REPORT
+          data class ColumnSpec(val name: String, val definition: String)
+
+          data class TableSpec(
+              val name: String,
+              val columns: List<ColumnSpec>,
+              val constraints: List<String> = emptyList()
+          ) {
+              fun createSql(): String {
+                  val lines = columns.map { "  " + it.name + " " + it.definition } +
+                      constraints.map { "  " + it }
+                  return "CREATE TABLE IF NOT EXISTS " + name + " (\n" + lines.joinToString(",\n") + "\n);"
+              }
           }
 
-          class MainActivity : ComponentActivity() {
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  val db = DatabaseHelper(this)
-                  setContent {
-                      MaterialTheme {
-                          AppRoot(db)
-                      }
+          // The ONLY place that describes this app's backend. Change it here and the script follows.
+          object BackendSpec {
+              const val BACKEND_NAME = "Teacher Attendance"
+              const val DATABASE = "teacherdb"
+              const val USER = "schoolapp"
+              const val PASSWORD = "ChangeMe_123"
+
+              val tables: List<TableSpec> = listOf(
+                  TableSpec(
+                      "tblTeachers",
+                      listOf(
+                          ColumnSpec("RecordID", "BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"),
+                          ColumnSpec("TeacherName", "TEXT NOT NULL"),
+                          ColumnSpec("FatherHusbandName", "TEXT NOT NULL"),
+                          ColumnSpec("AppointmentSession", "TEXT NOT NULL")
+                      )
+                  ),
+                  TableSpec(
+                      "tblAttendanceEnrollment",
+                      listOf(
+                          ColumnSpec("EnrollmentID", "BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"),
+                          ColumnSpec("EnrollmentRecordIDFK", "BIGINT NOT NULL REFERENCES tblTeachers(RecordID) ON DELETE CASCADE"),
+                          ColumnSpec("AttendanceEnrollmentSession", "TEXT NOT NULL"),
+                          ColumnSpec("AttendanceEnrollmentMonth", "INTEGER NOT NULL")
+                      ),
+                      listOf("UNIQUE (EnrollmentRecordIDFK, AttendanceEnrollmentSession, AttendanceEnrollmentMonth)")
+                  ),
+                  TableSpec(
+                      "tblAttendanceRecords",
+                      listOf(
+                          ColumnSpec("AttendanceID", "BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"),
+                          ColumnSpec("AttendanceRecordIDFK", "BIGINT NOT NULL REFERENCES tblTeachers(RecordID) ON DELETE CASCADE"),
+                          ColumnSpec("AttendanceEnrollmentIDFK", "BIGINT NOT NULL REFERENCES tblAttendanceEnrollment(EnrollmentID) ON DELETE CASCADE"),
+                          ColumnSpec("AttendanceDate", "TEXT NOT NULL"),
+                          ColumnSpec("AttendanceStatus", "TEXT NOT NULL")
+                      ),
+                      listOf("UNIQUE (AttendanceEnrollmentIDFK, AttendanceDate)")
+                  )
+              )
+
+              val tableNames: List<String> get() = tables.map { it.name }
+
+              // Readable description: names, tables, fields and relationships (REFERENCES = foreign key).
+              fun summary(): String = buildString {
+                  appendLine("Backend: " + BACKEND_NAME)
+                  appendLine("Database: " + DATABASE)
+                  appendLine("User: " + USER + " (password is inside the script)")
+                  tables.forEach { t ->
+                      appendLine()
+                      appendLine("Table " + t.name)
+                      t.columns.forEach { appendLine("  " + it.name + ": " + it.definition) }
+                      t.constraints.forEach { appendLine("  " + it) }
+                  }
+              }
+
+              // Shell script for PG Setup Console: starts the server, creates user, database and tables.
+              fun script(): String {
+                  val dir = "\$PREFIX/var/lib/postgresql"
+                  return buildString {
+                      appendLine("# Backend setup for: " + BACKEND_NAME)
+                      appendLine("pg_ctl -D " + dir + " status >/dev/null 2>&1 || pg_ctl -D " + dir + " -l " + dir + "/server.log start")
+                      appendLine("sleep 3")
+                      appendLine("psql -d postgres -tc \"SELECT 1 FROM pg_roles WHERE rolname='" + USER + "'\" | grep -q 1 || psql -d postgres -c \"CREATE ROLE " + USER + " LOGIN PASSWORD '" + PASSWORD + "'\"")
+                      appendLine("psql -d postgres -tc \"SELECT 1 FROM pg_database WHERE datname='" + DATABASE + "'\" | grep -q 1 || createdb -O " + USER + " " + DATABASE)
+                      appendLine("psql -U " + USER + " -d " + DATABASE + " <<'SQL'")
+                      tables.forEach { appendLine(it.createSql()) }
+                      appendLine("SQL")
+                      appendLine("psql -U " + USER + " -d " + DATABASE + " -c \"\\dt\"")
                   }
               }
           }
 
           @Composable
-          fun AppRoot(db: DatabaseHelper) {
-              var screen by remember { mutableStateOf(Screen.DASHBOARD) }
-              BackHandler(enabled = screen != Screen.DASHBOARD) { screen = Screen.DASHBOARD }
+          fun BackendSetupScreen(error: String, onRetry: () -> Unit) {
+              val context = LocalContext.current
+              val clipboard = LocalClipboardManager.current
+              val script = remember { BackendSpec.script() }
+              val mono = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp)
 
-              when (screen) {
-                  Screen.DASHBOARD -> DashboardScreen(db) { screen = it }
-                  Screen.ADD_TEACHER -> AddTeacherScreen(db) { screen = Screen.DASHBOARD }
-                  Screen.ENROL -> EnrolScreen(db) { screen = Screen.DASHBOARD }
-                  Screen.PROMOTE -> PromoteScreen(db) { screen = Screen.DASHBOARD }
-                  Screen.ATTENDANCE -> TakeAttendanceScreen(db) { screen = Screen.DASHBOARD }
-                  Screen.PRINT -> PrintAttendanceScreen(db) { screen = Screen.DASHBOARD }
-                  Screen.DELETE_TEACHER -> DeleteTeacherScreen(db) { screen = Screen.DASHBOARD }
-                  Screen.DELETE_ATTENDANCE -> DeleteAttendanceScreen(db) { screen = Screen.DASHBOARD }
-                  Screen.REPORT -> ReportScreen(db) { screen = Screen.DASHBOARD }
-              }
-          }
-          EOF
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(10.dp)
+              ) {
+                  Text("Backend not found", style = MaterialTheme.typography.headlineSmall)
+                  Text("This app needs its own PostgreSQL backend on this phone. It does not exist yet or the server is not running.")
+                  Text(error, color = MaterialTheme.colorScheme.error)
 
-      - name: Generate Wrapper 8.6
-        run: |
-          gradle wrapper --gradle-version 8.6
-          chmod +x gradlew
+                  Text("How to create it", style = MaterialTheme.typography.titleMedium)
+                  Text("1. In PG Setup Console, tap 1 Install server and Run (only once per phone).")
+                  Text("2. Tap Copy script below, open PG Setup Console, tap Paste from clipboard, then Run in Termux.")
+                  Text("3. Come back here and tap Retry.")
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+                  Text("Backend specification", style = MaterialTheme.typography.titleMedium)
+                  SelectionContainer { Text(BackendSpec.summary(), style = mono) }
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: School-Teacher-Attendance-V2-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+                  Text("Backend creation script", style = MaterialTheme.typography.titleMedium)
+                  OutlinedTextField(
+                      value = script,
+                      onValueChange = {},
+                      readOnly = true,
+                      textStyle = mono,
+                      minLines = 8,
+                      modifier = Modifier.fillMaxWidth()
+                  )
+
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+     
